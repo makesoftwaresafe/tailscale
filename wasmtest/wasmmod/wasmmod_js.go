@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/skip2/go-qrcode"
+	"inet.af/netaddr"
 	"tailscale.com/cmd/tailscale/cli"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnserver"
@@ -66,6 +67,13 @@ func main() {
 	ns.ForwardTCPIn = handleIncomingTCP
 	if err := ns.Start(); err != nil {
 		log.Fatalf("failed to start netstack: %v", err)
+	}
+	dialer.UseNetstackForIP = func(ip netaddr.IP) bool {
+		_, ok := eng.PeerForIP(ip)
+		return ok
+	}
+	dialer.NetstackDialTCP = func(ctx context.Context, dst netaddr.IPPort) (net.Conn, error) {
+		return ns.DialContextTCP(ctx, dst)
 	}
 
 	doc := js.Global().Get("document")
