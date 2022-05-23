@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"html"
 	"io"
@@ -29,7 +30,6 @@ import (
 	"tailscale.com/cmd/tailscale/cli"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnserver"
-	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/tsdial"
@@ -87,7 +87,7 @@ func main() {
 		return netstackHandlePacket(p, t)
 	}
 
-	var store ipn.StateStore = new(mem.Store)
+	var store ipn.StateStore = new(jsStateStore)
 	srv, err := ipnserver.New(log.Printf, "some-logid", store, eng, dialer, nil, ipnserver.Options{
 		SurviveDisconnects: true,
 	})
@@ -142,10 +142,11 @@ func main() {
 
 	start := func() {
 		err := lb.Start(ipn.Options{
-			Prefs: &ipn.Prefs{
+			StateKey: "wasm",
+			UpdatePrefs: &ipn.Prefs{
 				// go run ./cmd/trunkd/  -remote-url=https://controlplane.tailscale.com
 				//ControlURL:       "http://tsdev:8080",
-				ControlURL:       "https://controlplane.tailscale.com",
+				ControlURL:       ipn.DefaultControlURL,
 				RouteAll:         false,
 				AllowSingleHosts: true,
 				WantRunning:      true,
@@ -204,7 +205,8 @@ func main() {
 		log.Printf("got auth key")
 		go func() {
 			err := lb.Start(ipn.Options{
-				Prefs: &ipn.Prefs{
+				StateKey: "wasm",
+				UpdatePrefs: &ipn.Prefs{
 					// go run ./cmd/trunkd/  -remote-url=https://controlplane.tailscale.com
 					//ControlURL:       "http://tsdev:8080",
 					ControlURL:       "https://controlplane.tailscale.com",
@@ -413,3 +415,18 @@ func (l *oneConnListener) Addr() net.Addr { return dummyAddr("unused-address") }
 
 func (a dummyAddr) Network() string { return string(a) }
 func (a dummyAddr) String() string  { return string(a) }
+
+type jsStateStore struct{}
+
+func (_ *jsStateStore) ReadState(id ipn.StateKey) ([]byte, error) {
+	jsValue := js.Global().Call("getState", string(id))
+	if jsValue.String() == "" {
+		return nil, ipn.ErrStateNotExist
+	}
+	return hex.DecodeString(jsValue.String())
+}
+
+func (_ *jsStateStore) WriteState(id ipn.StateKey, bs []byte) error {
+	js.Global().Call("setState", string(id), hex.EncodeToString(bs))
+	return nil
+}

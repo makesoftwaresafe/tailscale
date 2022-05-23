@@ -6,6 +6,12 @@
     <script src="https://use.fontawesome.com/47de3a5ce8.js"></script>
     <script src="wasm_exec.js"></script>
     <script>
+      function setState(id, value) {
+        window.sessionStorage[`ipn-state-${id}`] = value;
+      }
+      function getState(id) {
+        return window.sessionStorage[`ipn-state-${id}`] || "";
+      }
       const go = new Go();
       WebAssembly.instantiateStreaming(fetch("test.wasm"), go.importObject).then((result) => {
           go.run(result.instance);
@@ -18,7 +24,7 @@
       <input type=button value="Logout" onclick='logoutClicked()'>
       <input type=button value="Goroutines" onclick='seeGoroutines()'>
       <input type=button value="StartLoginInteractive" onclick='startLoginInteractive()'>
-      <input type=button value="authkey" onclick='startAuthKey(prompt("auth key:", ""))'>      
+      <input type=button value="authkey" onclick='startAuthKey(prompt("auth key:", ""))'>
     </form>
     <div><b>Backend state: </b><span id='state'>(wasm loading)</span> <span id='loginURL'></span></div>
     <div class="term" style='width: 100%; height: 25em;'>
