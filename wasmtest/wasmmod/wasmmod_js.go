@@ -18,17 +18,14 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"runtime"
 	"strings"
-	"sync"
 	"syscall/js"
 	"time"
 
 	"github.com/skip2/go-qrcode"
 	"golang.org/x/crypto/ssh"
 	"inet.af/netaddr"
-	"tailscale.com/cmd/tailscale/cli"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnserver"
 	"tailscale.com/net/netns"
@@ -226,69 +223,6 @@ func main() {
 				AuthKey: authKey,
 			})
 			log.Printf("Start error: %v", err)
-		}()
-		return nil
-	}))
-
-	var termOutOnce sync.Once
-
-	js.Global().Set("runTailscaleCLI", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		if len(args) < 1 {
-			log.Printf("missing args")
-			return nil
-		}
-		// TODO(bradfitz): enforce that we're only running one
-		// CLI command at a time, as we modify package cli
-		// globals below, like cli.Fatalf.
-
-		go func() {
-			if len(args) >= 2 {
-				onDone := args[1]
-				defer onDone.Invoke() // re-print the prompt
-			}
-			/*
-				fs := js.Global().Get("globalThis").Get("fs")
-				oldWriteSync := fs.Get("writeSync")
-				defer fs.Set("writeSync", oldWriteSync)
-
-				fs.Set("writeSync", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-					if len(args) != 2 {
-						return nil
-					}
-					js.Global().Get("theTerminal").Call("write", fmt.Sprintf("Got a %T %v\r\n", args[1], args[1]))
-					return nil
-				}))
-			*/
-			line := args[0].String()
-			f := strings.Fields(line)
-			term := js.Global().Get("theTerminal")
-			termOutOnce.Do(func() {
-				cli.Stdout = termWriter{term}
-				cli.Stderr = termWriter{term}
-			})
-
-			cli.Fatalf = func(format string, a ...interface{}) {
-				term.Call("write", strings.ReplaceAll(fmt.Sprintf(format, a...), "\n", "\n\r"))
-				runtime.Goexit()
-			}
-
-			// TODO(bradfitz): add a cli package global logger and make that
-			// package use it, rather than messing with log.SetOutput.
-			log.SetOutput(cli.Stderr)
-			defer log.SetOutput(os.Stderr) // back to console
-
-			defer func() {
-				if e := recover(); e != nil {
-					term.Call("write", fmt.Sprintf("%s\r\n", e))
-					fmt.Fprintf(os.Stderr, "recovered panic from %q: %v", f, e)
-				}
-			}()
-
-			if err := cli.Run(f[1:]); err != nil {
-				fmt.Fprintf(os.Stderr, "CLI error on %q: %v\n", f, err)
-				term.Call("write", fmt.Sprintf("%v\r\n", err))
-				return
-			}
 		}()
 		return nil
 	}))

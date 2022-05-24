@@ -218,13 +218,6 @@ $(function () {
       },
       description: 'Prints this help message',
     },
-    tailscale: {
-      f: (line) => {
-        //term.writeln("TODO(bradfitz): run the tailscale command: "+line);
-        runTailscaleCLI(line, function () { term.prompt(term) });
-      },
-      description: 'run cmd/tailscale'
-    },
     http: {
       f: (line) => {
         runFakeCURL(line, function () { term.prompt(term) });
