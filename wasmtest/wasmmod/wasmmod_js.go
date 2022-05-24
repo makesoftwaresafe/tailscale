@@ -14,7 +14,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"html"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -29,13 +28,10 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnserver"
 	"tailscale.com/net/netns"
-	"tailscale.com/net/packet"
 	"tailscale.com/net/tsdial"
-	"tailscale.com/net/tstun"
 	"tailscale.com/safesocket"
 	"tailscale.com/types/logger"
 	"tailscale.com/wgengine"
-	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/netstack"
 )
 
@@ -61,7 +57,6 @@ func main() {
 	}
 	ns.ProcessLocalIPs = true
 	ns.ProcessSubnets = true
-	ns.ForwardTCPIn = handleIncomingTCP
 	if err := ns.Start(); err != nil {
 		log.Fatalf("failed to start netstack: %v", err)
 	}
@@ -75,22 +70,8 @@ func main() {
 
 	doc := js.Global().Get("document")
 	state := doc.Call("getElementById", "state")
-	topBar := doc.Call("getElementById", "topbar")
-	topBarStyle := topBar.Get("style")
 	netmapEle := doc.Call("getElementById", "netmap")
 	loginEle := doc.Call("getElementById", "loginURL")
-
-	netstackHandlePacket := tunDev.PostFilterIn
-	tunDev.PostFilterIn = func(p *packet.Parsed, t *tstun.Wrapper) filter.Response {
-		if p.IsEchoRequest() {
-			go func() {
-				topBarStyle.Set("background", "gray")
-				time.Sleep(100 * time.Millisecond)
-				topBarStyle.Set("background", "white")
-			}()
-		}
-		return netstackHandlePacket(p, t)
-	}
 
 	var store ipn.StateStore = new(jsStateStore)
 	srv, err := ipnserver.New(log.Printf, "some-logid", store, eng, dialer, nil, ipnserver.Options{
@@ -373,49 +354,6 @@ func (w termWriter) Write(p []byte) (n int, err error) {
 	w.o.Call("write", string(r))
 	return len(p), nil
 }
-
-func handleIncomingTCP(c net.Conn, port uint16) {
-	if port != 80 {
-		log.Printf("incoming conn on port %v; closing", port)
-		c.Close()
-		return
-	}
-	log.Printf("incoming conn on port %v", port)
-	s := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			log.Printf("Got HTTP request: %+v", r)
-			if c := strings.TrimPrefix(r.URL.Path, "/"); c != "" {
-				body := js.Global().Get("document").Get("body")
-				body.Set("bgColor", c)
-			}
-		}),
-	}
-	err := s.Serve(&oneConnListener{conn: c})
-	log.Printf("http.Serve: %v", err)
-}
-
-type dummyAddr string
-type oneConnListener struct {
-	conn net.Conn
-}
-
-func (l *oneConnListener) Accept() (c net.Conn, err error) {
-	c = l.conn
-	if c == nil {
-		err = io.EOF
-		return
-	}
-	err = nil
-	l.conn = nil
-	return
-}
-
-func (l *oneConnListener) Close() error { return nil }
-
-func (l *oneConnListener) Addr() net.Addr { return dummyAddr("unused-address") }
-
-func (a dummyAddr) Network() string { return string(a) }
-func (a dummyAddr) String() string  { return string(a) }
 
 type jsStateStore struct{}
 
