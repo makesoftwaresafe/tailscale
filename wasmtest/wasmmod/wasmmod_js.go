@@ -8,7 +8,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -27,6 +26,7 @@ import (
 	"time"
 
 	"github.com/skip2/go-qrcode"
+	"golang.org/x/crypto/ssh"
 	"inet.af/netaddr"
 	"tailscale.com/cmd/tailscale/cli"
 	"tailscale.com/ipn"
@@ -342,22 +342,81 @@ func main() {
 			host := f[1]
 
 			term := js.Global().Get("theTerminal")
+			writeError := func(label string, err error) {
+				term.Call("write", fmt.Sprintf("%s Error: %v\r\n", label, err))
+			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			c, err := dialer.UserDial(ctx, "tcp", net.JoinHostPort(host, "22"))
 			if err != nil {
-				term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
+				writeError("Dial", err)
 				return
 			}
 			defer c.Close()
-			br := bufio.NewReader(c)
-			greet, err := br.ReadString('\n')
+
+			config := &ssh.ClientConfig{
+				HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+			}
+
+			sshConn, _, _, err := ssh.NewClientConn(c, host, config)
 			if err != nil {
-				term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
+				writeError("SSH Connection", err)
 				return
 			}
-			term.Call("write", fmt.Sprintf("%v\r\n\r\nTODO(bradfitz): rest of the owl", strings.TrimSpace(greet)))
+			defer sshConn.Close()
+			term.Call("write", "SSH Connected\r\n")
+
+			sshClient := ssh.NewClient(sshConn, nil, nil)
+			defer sshClient.Close()
+
+			session, err := sshClient.NewSession()
+			if err != nil {
+				writeError("SSH Session", err)
+				return
+			}
+			term.Call("write", "Session Established\r\n")
+			defer session.Close()
+
+			stdin, err := session.StdinPipe()
+			if err != nil {
+				writeError("SSH Stdin", err)
+				return
+			}
+
+			session.Stdout = termWriter{term}
+			session.Stderr = termWriter{term}
+
+			term.Set("_onDataHook", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+				input := args[0].String()
+				_, err := stdin.Write([]byte(input))
+				if err != nil {
+					writeError("Write Input", err)
+				}
+				return nil
+			}))
+			defer func() {
+				term.Delete("_onDataHook")
+			}()
+
+			err = session.RequestPty("xterm", term.Get("rows").Int(), term.Get("cols").Int(), ssh.TerminalModes{})
+
+			if err != nil {
+				writeError("Pseudo Terminal", err)
+				return
+			}
+
+			err = session.Shell()
+			if err != nil {
+				writeError("Shell", err)
+				return
+			}
+
+			err = session.Wait()
+			if err != nil {
+				writeError("Exit", err)
+				return
+			}
 		}()
 		return nil
 	}))

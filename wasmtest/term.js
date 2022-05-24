@@ -88,6 +88,10 @@ $(function () {
     prompt(term);
 
     term.onData(e => {
+      if (term._onDataHook) {
+        term._onDataHook(e);
+        return;
+      }
       switch (e) {
         case '\u0003': // Ctrl+C
           term.write('^C');
@@ -214,13 +218,6 @@ $(function () {
       },
       description: 'Prints this help message',
     },
-    ssh: {
-      f: () => {
-        term.writeln("TODO(bradfitz): hook up golang.org/x/crypto/ssh");
-        term.prompt(term);
-      },
-      description: 'SSH to a Tailscale peer'
-    },
     tailscale: {
       f: (line) => {
         //term.writeln("TODO(bradfitz): run the tailscale command: "+line);
@@ -238,7 +235,7 @@ $(function () {
       f: (line) => {
         runSSH(line, function () { term.prompt(term) });
       },
-      description: 'SSH to host'
+      description: 'SSH to a Tailscale peer'
     },
     goroutines: {
       f: () => {
