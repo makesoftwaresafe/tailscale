@@ -65,10 +65,6 @@ func main() {
 		return ns.DialContextTCP(ctx, dst)
 	}
 
-	doc := js.Global().Get("document")
-	state := doc.Call("getElementById", "state")
-	loginEle := doc.Call("getElementById", "loginURL")
-
 	var store ipn.StateStore = new(jsStateStore)
 	srv, err := ipnserver.New(log.Printf, "some-logid", store, eng, dialer, nil, ipnserver.Options{
 		SurviveDisconnects: true,
@@ -78,16 +74,12 @@ func main() {
 	}
 	lb := srv.LocalBackend()
 
-	state.Set("innerHTML", "ready")
+	js.Global().Call("notifyState", int(ipn.NoState))
 
 	lb.SetNotifyCallback(func(n ipn.Notify) {
 		log.Printf("NOTIFY: %+v", n)
 		if n.State != nil {
-			state.Set("innerHTML", fmt.Sprint(*n.State))
-			switch *n.State {
-			case ipn.Running, ipn.Starting:
-				loginEle.Set("innerHTML", "")
-			}
+			js.Global().Call("notifyState", int(*n.State))
 		}
 		if nm := n.NetMap; nm != nil {
 			jsNetMap := jsNetMap{
@@ -114,13 +106,13 @@ func main() {
 				}),
 			}
 			if jsonNetMap, err := json.Marshal(jsNetMap); err == nil {
-				js.Global().Call("updateNetMap", string(jsonNetMap))
+				js.Global().Call("notifyNetMap", string(jsonNetMap))
 			} else {
 				log.Printf("Could not generate JSON netmap: %v", err)
 			}
 		}
 		if n.BrowseToURL != nil {
-			js.Global().Call("browseToURL", *n.BrowseToURL)
+			js.Global().Call("notifyBrowseToURL", *n.BrowseToURL)
 		}
 	})
 

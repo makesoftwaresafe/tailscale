@@ -3,7 +3,6 @@
 
 import { Terminal } from 'xterm';
 import { WebglAddon } from 'xterm-addon-webgl';
-import QRCode from "qrcode";
 
 function main() {
   // Custom theme to match style of xterm.js logo
@@ -142,38 +141,5 @@ function main() {
 
   runFakeTerminal();
 }
-
-globalThis.updateNetMap = function(netMapStr) {
-  const netMap = JSON.parse(netMapStr);
-  const netmapMode = document.getElementById("netMap");
-  netmapMode.textContent = JSON.stringify(netMap, null, 2);
-}
-
-globalThis.browseToURL = async function(url) {
-  const loginNode = document.getElementById("loginURL");
-  loginNode.innerHTML = "";
-  const linkNode = document.createElement("a");
-  linkNode.href = url;
-  linkNode.target = "_blank";
-  linkNode.textContent = url;
-  loginNode.appendChild(linkNode);
-
-  try {
-    const dataURL = await QRCode.toDataURL(url, {width: 512});
-    linkNode.appendChild(document.createElement("br"));
-    const imageNode = document.createElement("img");
-    imageNode.src = dataURL;
-    imageNode.width = 256;
-    imageNode.height = 256;
-    imageNode.border = "0";
-    linkNode.appendChild(imageNode);
-  } catch (err) {
-    console.error("Could not generate QR code:", err);
-  }
-}
-
-// Used by jsStateStore to persist IPN state
-window.setState = (id, value) => window.sessionStorage[`ipn-state-${id}`] = value;
-window.getState = (id) => window.sessionStorage[`ipn-state-${id}`] || "";
 
 main();
