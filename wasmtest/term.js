@@ -1,12 +1,11 @@
 // Hacked up version of https://xtermjs.org/js/demo.js
 // for now.
 
-import $ from "jquery/dist/jquery.slim.js"
 import { Terminal } from 'xterm';
 import { WebglAddon } from 'xterm-addon-webgl';
 import QRCode from "qrcode";
 
-$(function () {
+function main() {
   // Custom theme to match style of xterm.js logo
   var baseTheme = {
     foreground: '#F8F8F8',
@@ -245,7 +244,7 @@ $(function () {
   }
 
   runFakeTerminal();
-});
+}
 
 window.browseToURL = async function(url) {
   const loginNode = document.getElementById("loginURL");
@@ -273,3 +272,5 @@ window.browseToURL = async function(url) {
 // Used by jsStateStore to persist IPN state
 window.setState = (id, value) => window.sessionStorage[`ipn-state-${id}`] = value;
 window.getState = (id) => window.sessionStorage[`ipn-state-${id}`] || "";
+
+main();
