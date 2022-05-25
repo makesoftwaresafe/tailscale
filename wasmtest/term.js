@@ -28,37 +28,15 @@ function main() {
     white: '#F8F8F8',
     brightWhite: '#FFFFFF'
   };
-  // vscode-snazzy https://github.com/Tyriar/vscode-snazzy
-  var otherTheme = {
-    foreground: '#eff0eb',
-    background: '#282a36',
-    selection: '#97979b33',
-    black: '#282a36',
-    brightBlack: '#686868',
-    red: '#ff5c57',
-    brightRed: '#ff5c57',
-    green: '#5af78e',
-    brightGreen: '#5af78e',
-    yellow: '#f3f99d',
-    brightYellow: '#f3f99d',
-    blue: '#57c7ff',
-    brightBlue: '#57c7ff',
-    magenta: '#ff6ac1',
-    brightMagenta: '#ff6ac1',
-    cyan: '#9aedfe',
-    brightCyan: '#9aedfe',
-    white: '#f1f1f0',
-    brightWhite: '#eff0eb'
-  };
-  var isBaseTheme = true;
 
+  const termContainerNode = document.querySelector('.term .inner');
   var term = new Terminal({
     fontFamily: '"Cascadia Code", Menlo, monospace',
     theme: baseTheme,
     cursorBlink: true
   });
-  term.open(document.querySelector('.term .inner'));
-  theTerminal = term;
+  term.open(termContainerNode);
+  globalThis.theTerminal = term;
 
   var isWebglEnabled = false;
   try {
@@ -70,7 +48,7 @@ function main() {
   }
 
   // Cancel wheel events from scrolling the page if the terminal has scrollback
-  document.querySelector('.xterm').addEventListener('wheel', e => {
+  termContainerNode.addEventListener('wheel', e => {
     if (term.buffer.active.baseY > 0) {
       e.preventDefault();
     }
@@ -119,87 +97,6 @@ function main() {
             command += e;
             term.write(e);
           }
-      }
-    });
-
-    // Create a very simple link provider which hardcodes links for certain lines
-    term.registerLinkProvider({
-      provideLinks(bufferLineNumber, callback) {
-        switch (bufferLineNumber) {
-          case 2:
-            callback([
-              {
-                text: 'VS Code',
-                range: { start: { x: 28, y: 2 }, end: { x: 34, y: 2 } },
-                activate() {
-                  window.open('https://github.com/microsoft/vscode', '_blank');
-                }
-              },
-              {
-                text: 'Hyper',
-                range: { start: { x: 37, y: 2 }, end: { x: 41, y: 2 } },
-                activate() {
-                  window.open('https://github.com/vercel/hyper', '_blank');
-                }
-              },
-              {
-                text: 'Theia',
-                range: { start: { x: 47, y: 2 }, end: { x: 51, y: 2 } },
-                activate() {
-                  window.open('https://github.com/eclipse-theia/theia', '_blank');
-                }
-              }
-            ]);
-            return;
-          case 8:
-            callback([
-              {
-                text: 'WebGL renderer',
-                range: { start: { x: 54, y: 8 }, end: { x: 67, y: 8 } },
-                activate() {
-                  window.open('https://npmjs.com/package/xterm-addon-webgl', '_blank');
-                }
-              }
-            ]);
-            return;
-          case 14:
-            callback([
-              {
-                text: 'Links',
-                range: { start: { x: 45, y: 14 }, end: { x: 49, y: 14 } },
-                activate() {
-                  window.alert('You can handle links any way you want');
-                }
-              },
-              {
-                text: 'themes',
-                range: { start: { x: 52, y: 14 }, end: { x: 57, y: 14 } },
-                activate() {
-                  isBaseTheme = !isBaseTheme;
-                  term.setOption('theme', isBaseTheme ? baseTheme : otherTheme);
-                  document.querySelector('.demo .inner').classList.toggle('other-theme', !isBaseTheme);
-                  term.write(`\r\nActivated ${isBaseTheme ? 'xterm.js' : 'snazzy'} theme`);
-                  prompt(term);
-                }
-              },
-              {
-                text: 'addons',
-                range: { start: { x: 60, y: 14 }, end: { x: 65, y: 14 } },
-                activate() {
-                  window.open('/docs/guides/using-addons/', '_blank');
-                }
-              },
-              {
-                text: 'typed API',
-                range: { start: { x: 68, y: 14 }, end: { x: 76, y: 14 } },
-                activate() {
-                  window.open('https://github.com/xtermjs/xterm.js/blob/master/typings/xterm.d.ts', '_blank');
-                }
-              },
-            ]);
-            return;
-        }
-        callback(undefined);
       }
     });
   }
