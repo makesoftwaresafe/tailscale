@@ -218,24 +218,12 @@ $(function () {
       },
       description: 'Prints this help message',
     },
-    http: {
-      f: (line) => {
-        runFakeCURL(line, function () { term.prompt(term) });
-      },
-      description: 'fetch a URL'
-    },
     ssh: {
       f: (line) => {
         runSSH(line, function () { term.prompt(term) });
       },
       description: 'SSH to a Tailscale peer'
     },
-    goroutines: {
-      f: () => {
-        seeGoroutines();
-      },
-      description: 'dump goroutines'
-    }
   };
 
   function runCommand(term, text) {

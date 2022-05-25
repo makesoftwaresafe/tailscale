@@ -16,8 +16,6 @@ import (
 	"html"
 	"log"
 	"net"
-	"net/http"
-	"runtime"
 	"strings"
 	"syscall/js"
 	"time"
@@ -166,79 +164,6 @@ func main() {
 				start()
 			}
 			lb.StartLoginInteractive()
-		}()
-		return nil
-	}))
-
-	js.Global().Set("seeGoroutines", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		full := make([]byte, 1<<20)
-		buf := full[:runtime.Stack(full, true)]
-		js.Global().Get("theTerminal").Call("reset")
-		withCR := make([]byte, 0, len(buf)+bytes.Count(buf, []byte{'\n'}))
-		for _, b := range buf {
-			if b == '\n' {
-				withCR = append(withCR, "\r\n"...)
-			} else {
-				withCR = append(withCR, b)
-			}
-		}
-		js.Global().Get("theTerminal").Call("write", string(withCR))
-		return nil
-	}))
-
-	js.Global().Set("startAuthKey", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		authKey := args[0].String()
-		log.Printf("got auth key")
-		go func() {
-			err := lb.Start(ipn.Options{
-				StateKey: "wasm",
-				UpdatePrefs: &ipn.Prefs{
-					// go run ./cmd/trunkd/  -remote-url=https://controlplane.tailscale.com
-					//ControlURL:       "http://tsdev:8080",
-					ControlURL:       "https://controlplane.tailscale.com",
-					RouteAll:         false,
-					AllowSingleHosts: true,
-					WantRunning:      true,
-					Hostname:         "wasm",
-				},
-				AuthKey: authKey,
-			})
-			log.Printf("Start error: %v", err)
-		}()
-		return nil
-	}))
-
-	js.Global().Set("runFakeCURL", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		if len(args) < 2 {
-			log.Printf("missing args")
-			return nil
-		}
-		go func() {
-			onDone := args[1]
-			defer onDone.Invoke() // re-print the prompt
-
-			line := args[0].String()
-			f := strings.Fields(line)
-			if len(f) < 2 {
-				return
-			}
-			wantURL := f[1]
-
-			term := js.Global().Get("theTerminal")
-
-			c := &http.Client{
-				Transport: &http.Transport{
-					DialContext: dialer.UserDial,
-				},
-			}
-
-			res, err := c.Get(wantURL)
-			if err != nil {
-				term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
-				return
-			}
-			defer res.Body.Close()
-			res.Write(termWriter{term})
 		}()
 		return nil
 	}))
