@@ -10,7 +10,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"html"
@@ -20,7 +19,6 @@ import (
 	"syscall/js"
 	"time"
 
-	"github.com/skip2/go-qrcode"
 	"golang.org/x/crypto/ssh"
 	"inet.af/netaddr"
 	"tailscale.com/ipn"
@@ -117,10 +115,7 @@ func main() {
 			netmapEle.Set("innerHTML", buf.String())
 		}
 		if n.BrowseToURL != nil {
-			esc := html.EscapeString(*n.BrowseToURL)
-			pngBytes, _ := qrcode.Encode(*n.BrowseToURL, qrcode.Medium, 256)
-			qrDataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes)
-			loginEle.Set("innerHTML", fmt.Sprintf("<a href='%s' target=_blank>%s<br/><img src='%s' border=0></a>", esc, esc, qrDataURL))
+			js.Global().Call("browseToURL", *n.BrowseToURL)
 		}
 	})
 
