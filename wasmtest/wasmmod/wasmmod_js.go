@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"strings"
 	"syscall/js"
 	"time"
 
@@ -74,12 +73,15 @@ func main() {
 	}
 	lb := srv.LocalBackend()
 
-	js.Global().Call("notifyState", int(ipn.NoState))
+	notifyState := func(state ipn.State) {
+		js.Global().Call("notifyState", int(state))
+	}
+	notifyState(ipn.NoState)
 
 	lb.SetNotifyCallback(func(n ipn.Notify) {
 		log.Printf("NOTIFY: %+v", n)
 		if n.State != nil {
-			js.Global().Call("notifyState", int(*n.State))
+			notifyState(*n.State)
 		}
 		if nm := n.NetMap; nm != nil {
 			jsNetMap := jsNetMap{
@@ -166,16 +168,19 @@ func main() {
 			return nil
 		}
 		go func() {
-			onDone := args[1]
+			host := args[0].String()
+			writeFn := args[1]
+			setReadFn := args[2]
+			rows := args[3].Int()
+			cols := args[4].Int()
+			onDone := args[5]
 			defer onDone.Invoke() // re-print the prompt
 
-			line := args[0].String()
-			f := strings.Fields(line)
-			host := f[1]
-
-			term := js.Global().Get("theTerminal")
+			write := func(s string) {
+				writeFn.Invoke(s)
+			}
 			writeError := func(label string, err error) {
-				term.Call("write", fmt.Sprintf("%s Error: %v\r\n", label, err))
+				write(fmt.Sprintf("%s Error: %v\r\n", label, err))
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -197,7 +202,7 @@ func main() {
 				return
 			}
 			defer sshConn.Close()
-			term.Call("write", "SSH Connected\r\n")
+			write("SSH Connected\r\n")
 
 			sshClient := ssh.NewClient(sshConn, nil, nil)
 			defer sshClient.Close()
@@ -207,7 +212,7 @@ func main() {
 				writeError("SSH Session", err)
 				return
 			}
-			term.Call("write", "Session Established\r\n")
+			write("Session Established\r\n")
 			defer session.Close()
 
 			stdin, err := session.StdinPipe()
@@ -216,10 +221,10 @@ func main() {
 				return
 			}
 
-			session.Stdout = termWriter{term}
-			session.Stderr = termWriter{term}
+			session.Stdout = termWriter{writeFn}
+			session.Stderr = termWriter{writeFn}
 
-			term.Set("_onDataHook", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+			setReadFn.Invoke(js.FuncOf(func(this js.Value, args []js.Value) interface{} {
 				input := args[0].String()
 				_, err := stdin.Write([]byte(input))
 				if err != nil {
@@ -227,11 +232,8 @@ func main() {
 				}
 				return nil
 			}))
-			defer func() {
-				term.Delete("_onDataHook")
-			}()
 
-			err = session.RequestPty("xterm", term.Get("rows").Int(), term.Get("cols").Int(), ssh.TerminalModes{})
+			err = session.RequestPty("xterm", rows, cols, ssh.TerminalModes{})
 
 			if err != nil {
 				writeError("Pseudo Terminal", err)
@@ -263,18 +265,18 @@ func main() {
 }
 
 type termWriter struct {
-	o js.Value
+	f js.Value
 }
 
 func (w termWriter) Write(p []byte) (n int, err error) {
 	r := bytes.Replace(p, []byte("\n"), []byte("\n\r"), -1)
-	w.o.Call("write", string(r))
+	w.f.Invoke(string(r))
 	return len(p), nil
 }
 
 type jsNetMap struct {
 	Self  jsNetMapSelfNode   `json:"self"`
-	Peers []jsNetMapPeerNode `json":peers"`
+	Peers []jsNetMapPeerNode `json:"peers"`
 }
 
 type jsNetMapNode struct {

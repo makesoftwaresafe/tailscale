@@ -1,5 +1,4 @@
 import "./wasm_exec";
-import "./term";
 import "./notifier";
 import "./js-state-store"
 

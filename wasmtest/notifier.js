@@ -1,4 +1,5 @@
 import QRCode from "qrcode";
+import {ssh} from "./ssh";
 
 /**
  * @fileoverview Notification callback functions (bridged from ipn.Notify)
@@ -31,8 +32,32 @@ const State = {
 
  globalThis.notifyNetMap = function(netMapStr) {
     const netMap = JSON.parse(netMapStr);
-    const netmapMode = document.getElementById("netMap");
-    netmapMode.textContent = JSON.stringify(netMap, null, 2);
+    console.log("Received net map: " + JSON.stringify(netMap, null, 2));
+
+    const peersNode = document.getElementById("peers");
+    peersNode.innerHTML = "";
+
+    for (const peer of netMap.peers) {
+        if (!peer.hasSSHHostKeys) {
+            continue;
+        }
+        const peerNode = document.createElement("div");
+        peerNode.className = "peer";
+        const nameNode = document.createElement("div");
+        nameNode.className = "name";
+        nameNode.textContent = peer.name;
+        peerNode.appendChild(nameNode);
+
+        const sshButtonNode = document.createElement("button");
+        sshButtonNode.className = "ssh";
+        sshButtonNode.addEventListener("click", function() {
+            ssh(peer.name)
+        });
+        sshButtonNode.textContent = "SSH";
+        peerNode.appendChild(sshButtonNode);
+
+        peersNode.appendChild(peerNode);
+    }
   };
 
   globalThis.notifyBrowseToURL = async function(url) {

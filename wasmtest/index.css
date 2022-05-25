@@ -13,3 +13,29 @@
     min-height: 20px;
     background-color: #ffffff20;
 }
+
+#peers {
+    width: 100%;
+}
+
+.peer {
+    display: flex;
+    justify-content: space-between;
+    padding: 2px;
+}
+
+.peer:hover {
+    background: #eee;
+}
+
+.peer .name {
+    font-family: monospace;
+}
+
+.peer .ssh {
+    padding: 2px;
+    border-radius: 4px;
+    background-color: #ddd;
+    color: #000;
+    border: 0;
+}
