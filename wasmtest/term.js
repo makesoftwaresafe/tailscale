@@ -143,7 +143,13 @@ function main() {
   runFakeTerminal();
 }
 
-window.browseToURL = async function(url) {
+globalThis.updateNetMap = function(netMapStr) {
+  const netMap = JSON.parse(netMapStr);
+  const netmapMode = document.getElementById("netMap");
+  netmapMode.textContent = JSON.stringify(netMap, null, 2);
+}
+
+globalThis.browseToURL = async function(url) {
   const loginNode = document.getElementById("loginURL");
   loginNode.innerHTML = "";
   const linkNode = document.createElement("a");

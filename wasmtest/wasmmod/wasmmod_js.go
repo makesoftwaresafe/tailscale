@@ -11,8 +11,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
-	"html"
 	"log"
 	"net"
 	"strings"
@@ -26,6 +26,7 @@ import (
 	"tailscale.com/net/netns"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/safesocket"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/netstack"
@@ -66,7 +67,6 @@ func main() {
 
 	doc := js.Global().Get("document")
 	state := doc.Call("getElementById", "state")
-	netmapEle := doc.Call("getElementById", "netmap")
 	loginEle := doc.Call("getElementById", "loginURL")
 
 	var store ipn.StateStore = new(jsStateStore)
@@ -90,29 +90,34 @@ func main() {
 			}
 		}
 		if nm := n.NetMap; nm != nil {
-			var buf bytes.Buffer
-			fmt.Fprintf(&buf, "<p>Name: <b>%s</b></p>\n", html.EscapeString(nm.Name))
-			fmt.Fprintf(&buf, "<p>Addresses: ")
-			for i, a := range nm.Addresses {
-				if i == 0 {
-					fmt.Fprintf(&buf, "<b>%s</b>", a.IP())
-				} else {
-					fmt.Fprintf(&buf, ", %s", a.IP())
-				}
+			jsNetMap := jsNetMap{
+				Self: jsNetMapSelfNode{
+					jsNetMapNode: jsNetMapNode{
+						Name:       nm.Name,
+						Addresses:  mapSlice(nm.Addresses, func(a netaddr.IPPrefix) string { return a.IP().String() }),
+						NodeKey:    nm.NodeKey.String(),
+						MachineKey: nm.MachineKey.String(),
+					},
+					MachineStatus: int(nm.MachineStatus),
+				},
+				Peers: mapSlice(nm.Peers, func(p *tailcfg.Node) jsNetMapPeerNode {
+					return jsNetMapPeerNode{
+						jsNetMapNode: jsNetMapNode{
+							Name:       p.Name,
+							Addresses:  mapSlice(p.Addresses, func(a netaddr.IPPrefix) string { return a.IP().String() }),
+							MachineKey: p.Machine.String(),
+							NodeKey:    p.Key.String(),
+						},
+						Online:         *p.Online,
+						HasSSHHostKeys: p.Hostinfo.SSH_HostKeys().Len() > 0,
+					}
+				}),
 			}
-			fmt.Fprintf(&buf, "</p>")
-			fmt.Fprintf(&buf, "<p>Machine: <b>%v</b>, %v</p>\n", nm.MachineStatus, nm.MachineKey)
-			fmt.Fprintf(&buf, "<p>Nodekey: %v</p>\n", nm.NodeKey)
-			fmt.Fprintf(&buf, "<hr><table>")
-			for _, p := range nm.Peers {
-				var ip string
-				if len(p.Addresses) > 0 {
-					ip = p.Addresses[0].IP().String()
-				}
-				fmt.Fprintf(&buf, "<tr><td>%s</td><td>%s</td></tr>\n", ip, html.EscapeString(p.Name))
+			if jsonNetMap, err := json.Marshal(jsNetMap); err == nil {
+				js.Global().Call("updateNetMap", string(jsonNetMap))
+			} else {
+				log.Printf("Could not generate JSON netmap: %v", err)
 			}
-			fmt.Fprintf(&buf, "</table>")
-			netmapEle.Set("innerHTML", buf.String())
 		}
 		if n.BrowseToURL != nil {
 			js.Global().Call("browseToURL", *n.BrowseToURL)
@@ -275,6 +280,30 @@ func (w termWriter) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
+type jsNetMap struct {
+	Self  jsNetMapSelfNode   `json:"self"`
+	Peers []jsNetMapPeerNode `json":peers"`
+}
+
+type jsNetMapNode struct {
+	Name          string   `json:"name"`
+	Addresses     []string `json:"addresses"`
+	MachineStatus int      `json:"machineStatus"`
+	MachineKey    string   `json:"machineKey"`
+	NodeKey       string   `json:"nodeKey"`
+}
+
+type jsNetMapSelfNode struct {
+	jsNetMapNode
+	MachineStatus int `json:"machineStatus"`
+}
+
+type jsNetMapPeerNode struct {
+	jsNetMapNode
+	Online         bool `json:"online"`
+	HasSSHHostKeys bool `json:"hasSSHHostKeys"`
+}
+
 type jsStateStore struct{}
 
 func (_ *jsStateStore) ReadState(id ipn.StateKey) ([]byte, error) {
@@ -288,4 +317,12 @@ func (_ *jsStateStore) ReadState(id ipn.StateKey) ([]byte, error) {
 func (_ *jsStateStore) WriteState(id ipn.StateKey, bs []byte) error {
 	js.Global().Call("setState", string(id), hex.EncodeToString(bs))
 	return nil
+}
+
+func mapSlice[T any, M any](a []T, f func(T) M) []M {
+	n := make([]M, len(a))
+	for i, e := range a {
+		n[i] = f(e)
+	}
+	return n
 }
