@@ -1,6 +1,10 @@
 // Hacked up version of https://xtermjs.org/js/demo.js
 // for now.
 
+import $ from "jquery/dist/jquery.slim.js"
+import { Terminal } from 'xterm';
+import { WebglAddon } from 'xterm-addon-webgl';
+
 $(function () {
   // Custom theme to match style of xterm.js logo
   var baseTheme = {
@@ -48,7 +52,7 @@ $(function () {
   };
   var isBaseTheme = true;
 
-  var term = new window.Terminal({
+  var term = new Terminal({
     fontFamily: '"Cascadia Code", Menlo, monospace',
     theme: baseTheme,
     cursorBlink: true
@@ -58,7 +62,7 @@ $(function () {
 
   var isWebglEnabled = false;
   try {
-    const webgl = new window.WebglAddon.WebglAddon();
+    const webgl = new WebglAddon();
     term.loadAddon(webgl);
     isWebglEnabled = true;
   } catch (e) {
@@ -241,3 +245,7 @@ $(function () {
 
   runFakeTerminal();
 });
+
+// Used by jsStateStore to persist IPN state
+window.setState = (id, value) => window.sessionStorage[`ipn-state-${id}`] = value;
+window.getState = (id) => window.sessionStorage[`ipn-state-${id}`] || "";
