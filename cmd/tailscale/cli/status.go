@@ -128,20 +128,22 @@ func runStatus(ctx context.Context, args []string) error {
 		return err
 	}
 
+	// print Health check information prior to checking LocalBackend state as
+	// it may provide an explanation to the user if we choose to exit early
+	if len(st.Health) > 0 {
+		printf("# Health check:\n")
+		for _, m := range st.Health {
+			printf("#     - %s\n", m)
+		}
+	}
+
 	description, ok := isRunningOrStarting(st)
 	if !ok {
 		outln(description)
 		os.Exit(1)
 	}
 
-	if len(st.Health) > 0 {
-		printf("# Health check:\n")
-		for _, m := range st.Health {
-			printf("#     - %s\n", m)
-		}
-		outln()
-	}
-
+	outln()
 	var buf bytes.Buffer
 	f := func(format string, a ...any) { fmt.Fprintf(&buf, format, a...) }
 	printPS := func(ps *ipnstate.PeerStatus) {

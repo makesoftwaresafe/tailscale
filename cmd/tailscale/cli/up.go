@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/peterbourgon/ff/v3/ffcli"
@@ -114,6 +115,7 @@ func newUpFlagSet(goos string, upArgs *upArgsT) *flag.FlagSet {
 	case "windows":
 		upf.BoolVar(&upArgs.forceDaemon, "unattended", false, "run in \"Unattended Mode\" where Tailscale keeps running even after the current GUI user logs out (Windows-only)")
 	}
+	upf.IntVar(&upArgs.timeout, "timeout", 0, "maximum amount of time (in seconds) to wait for tailscaled to enter a Running state; default (0) blocks forever")
 	return upf
 }
 
@@ -146,6 +148,7 @@ type upArgsT struct {
 	hostname               string
 	opUser                 string
 	json                   bool
+	timeout                int
 }
 
 func (a upArgsT) getAuthKey() (string, error) {
@@ -632,6 +635,11 @@ func runUp(ctx context.Context, args []string) error {
 	// need to prioritize reads from 'running' if it's
 	// readable; its send does happen before the pump mechanism
 	// shuts down. (Issue 2333)
+	var timeoutCh <-chan time.Time
+	if upArgs.timeout > 0 {
+		timeoutTimer := time.NewTimer(time.Second * time.Duration(upArgs.timeout))
+		timeoutCh = timeoutTimer.C
+	}
 	select {
 	case <-running:
 		return nil
@@ -649,6 +657,8 @@ func runUp(ctx context.Context, args []string) error {
 		default:
 		}
 		return err
+	case <-timeoutCh:
+		return errors.New(`timeout waiting for Tailscale service to enter a Running state; check health with "tailscale status"`)
 	}
 }
 
@@ -705,7 +715,7 @@ func addPrefFlagMapping(flagName string, prefNames ...string) {
 // correspond to an ipn.Pref.
 func preflessFlag(flagName string) bool {
 	switch flagName {
-	case "auth-key", "force-reauth", "reset", "qr", "json":
+	case "auth-key", "force-reauth", "reset", "qr", "json", "timeout":
 		return true
 	}
 	return false

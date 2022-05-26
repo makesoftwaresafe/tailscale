@@ -1084,7 +1084,7 @@ func loadServerPubKeys(ctx context.Context, httpc *http.Client, serverURL string
 	}
 	res, err := httpc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch control key: %v", err)
+		return nil, fmt.Errorf("fetch control key: %w", err)
 	}
 	defer res.Body.Close()
 	b, err := ioutil.ReadAll(io.LimitReader(res.Body, 64<<10))
