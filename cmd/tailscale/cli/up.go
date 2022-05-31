@@ -304,6 +304,7 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 	prefs.RouteAll = upArgs.acceptRoutes
 
 	if upArgs.exitNodeIP != "" {
+		//TODO(warrick): SetExitNodeIP checks for IP or DNS match - add get exit node hostname if it exists
 		if err := prefs.SetExitNodeIP(upArgs.exitNodeIP, st); err != nil {
 			var e ipn.ExitNodeLocalIPError
 			if errors.As(err, &e) {
@@ -473,6 +474,8 @@ func runUp(ctx context.Context, args []string) error {
 		_, err := localClient.EditPrefs(ctx, justEditMP)
 		return err
 	}
+
+	// TODO(warrick): update status based on new prefs? local UpdateStatus to set ExitNodeIP & ExitNodeHostname using st?
 
 	// At this point we need to subscribe to the IPN bus to watch
 	// for state transitions and possible need to authenticate.

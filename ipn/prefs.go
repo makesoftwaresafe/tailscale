@@ -100,6 +100,9 @@ type Prefs struct {
 	ExitNodeID tailcfg.StableNodeID
 	ExitNodeIP netaddr.IP
 
+	// ExitNodeHostname is the hostname of the exit node.
+	ExitNodeHostname string
+
 	// ExitNodeAllowLANAccess indicates whether locally accessible subnets should be
 	// routed directly or via the exit node.
 	ExitNodeAllowLANAccess bool
@@ -206,6 +209,7 @@ type MaskedPrefs struct {
 	AllowSingleHostsSet       bool `json:",omitempty"`
 	ExitNodeIDSet             bool `json:",omitempty"`
 	ExitNodeIPSet             bool `json:",omitempty"`
+	ExitNodeHostnameSet       bool `json:",omitempty"`
 	ExitNodeAllowLANAccessSet bool `json:",omitempty"`
 	CorpDNSSet                bool `json:",omitempty"`
 	RunSSHSet                 bool `json:",omitempty"`
@@ -569,17 +573,41 @@ func exitNodeIPOfArg(s string, st *ipnstate.Status) (ip netaddr.IP, err error) {
 	}
 }
 
-// SetExitNodeIP validates and sets the ExitNodeIP from a user-provided string
+// exitNodeHNameOfArg returns exit node Hostname from ip
+func exitNodeHNameOfArg(st *ipnstate.Status, ip netaddr.IP) (hname string, err error) {
+	if ip.IsZero() {
+		return hname, os.ErrInvalid
+	}
+	if st.BackendState == "Running" {
+		ps, ok := peerWithTailscaleIP(st, ip)
+		if !ok {
+			return hname, fmt.Errorf("no node found in netmap with IP %v", ip)
+		}
+		if !ps.ExitNodeOption {
+			return hname, fmt.Errorf("node %v is not advertising an exit node", ip)
+		}
+		hname = ps.HostName
+	}
+	return hname, nil
+}
+
+// SetExitNodeIP validates and sets the ExitNodeIP and ExitNodeHostname from a user-provided string
 // specifying either an IP address or a MagicDNS base name ("foo", as opposed to
 // "foo.bar.beta.tailscale.net"). This method does not mutate ExitNodeID and
 // will fail if ExitNodeID is already set.
 func (p *Prefs) SetExitNodeIP(s string, st *ipnstate.Status) error {
+	//TODO(warrick): up exitNodeIP func prioritizes IP - maps ID to an IP if only ID given - should this exist?
 	if !p.ExitNodeID.IsZero() {
 		return ErrExitNodeIDAlreadySet
 	}
 	ip, err := exitNodeIPOfArg(s, st)
 	if err == nil {
 		p.ExitNodeIP = ip
+	}
+	// TODO(warrick): verify that ExitNodeID case doesn't need an hname grab
+	hname, err := exitNodeHNameOfArg(st, ip)
+	if err == nil {
+		p.ExitNodeHostname = hname
 	}
 	return err
 }

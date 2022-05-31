@@ -501,7 +501,11 @@ func (b *LocalBackend) populatePeerStatusLocked(sb *ipnstate.StatusBuilder) {
 			ShareeNode:     p.Hostinfo.ShareeNode(),
 			ExitNode:       p.StableID != "" && p.StableID == b.prefs.ExitNodeID,
 			ExitNodeOption: exitNodeOption,
-			SSH_HostKeys:   p.Hostinfo.SSH_HostKeys().AsSlice(),
+			//TODO(warrick): Confirm this updates ps correctly or updates don't filter
+			ExitNodeIP:       b.prefs.ExitNodeIP, // if set ExitNodeIP is default in prefs
+			ExitNodeHostName: b.prefs.ExitNodeHostname,
+			ExitNodeUsage:    !b.prefs.ExitNodeIP.IsZero(),
+			SSH_HostKeys:     p.Hostinfo.SSH_HostKeys().AsSlice(),
 		})
 	}
 }
