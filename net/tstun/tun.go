@@ -28,7 +28,10 @@ import (
 // 1280 is the smallest MTU allowed for IPv6, which is a sensible
 // "probably works everywhere" setting until we develop proper PMTU
 // discovery.
-var tunMTU = 1280
+var tunMTU = DefaultMTU
+
+// DefaultMTU is the Tailscale default MTU.
+const DefaultMTU = 1280
 
 func init() {
 	if mtu, ok := envknob.LookupInt("TS_DEBUG_MTU"); ok {
