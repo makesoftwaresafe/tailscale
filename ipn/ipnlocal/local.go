@@ -400,7 +400,6 @@ func (b *LocalBackend) UpdateStatus(sb *ipnstate.StatusBuilder) {
 func (b *LocalBackend) updateStatus(sb *ipnstate.StatusBuilder, extraLocked func(*ipnstate.StatusBuilder)) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	var exitNodeIP netaddr.IP
 	sb.MutateStatus(func(s *ipnstate.Status) {
 		s.Version = version.Long
 		s.BackendState = b.state.String()
@@ -426,7 +425,6 @@ func (b *LocalBackend) updateStatus(sb *ipnstate.StatusBuilder, extraLocked func
 			s.CurrentTailnet.MagicDNSEnabled = b.netMap.DNS.Proxied
 			s.CurrentTailnet.Name = b.netMap.Domain
 		}
-		exitNodeIP = exitNodeToIP(b.prefs, s)
 	})
 	sb.MutateSelfStatus(func(ss *ipnstate.PeerStatus) {
 		ss.Online = health.GetInPollNetMap()
@@ -443,7 +441,6 @@ func (b *LocalBackend) updateStatus(sb *ipnstate.StatusBuilder, extraLocked func
 		} else {
 			ss.HostName, _ = os.Hostname()
 		}
-		ss.ExitNodeIP = exitNodeIP // Update status with ExitNodeIP
 		for _, pln := range b.peerAPIListeners {
 			ss.PeerAPIURL = append(ss.PeerAPIURL, pln.urlStr)
 		}
@@ -456,26 +453,19 @@ func (b *LocalBackend) updateStatus(sb *ipnstate.StatusBuilder, extraLocked func
 	}
 }
 
-// TODO(warrick): This is dup from up. Move up here or make up accessible
-// exitNodeToIP returns the exit node IP from p, using st to map
-// it from its ID form to an IP address if needed.
-func exitNodeToIP(p *ipn.Prefs, st *ipnstate.Status) (ip netaddr.IP) {
-	if p == nil {
-		return
-	}
-	if !p.ExitNodeIP.IsZero() {
-		return p.ExitNodeIP
-	}
-	id := p.ExitNodeID
-	if id.IsZero() {
-		return
-	}
-	for _, p := range st.Peer {
-		if p.ID == id {
-			if len(p.TailscaleIPs) > 0 {
-				return p.TailscaleIPs[0]
+// exitNodeIP returns the exit node IP from and netMap.
+func (b *LocalBackend) exitNodeIP() (ip netaddr.IP) {
+	if !b.prefs.ExitNodeIP.IsZero() {
+		return b.prefs.ExitNodeIP
+	} else {
+		// convert exit node ID to IP
+		for _, bP := range b.netMap.Peers {
+			if bP.StableID == b.prefs.ExitNodeID {
+				if len(bP.Addresses) > 0 {
+					return bP.Addresses[0].IP()
+				}
+				break
 			}
-			break
 		}
 	}
 	return
@@ -512,19 +502,6 @@ func (b *LocalBackend) populatePeerStatusLocked(sb *ipnstate.StatusBuilder) {
 			v := views.IPPrefixSliceOf(p.PrimaryRoutes)
 			primaryRoutes = &v
 		}
-		var exitNodeIP netaddr.IP
-		if !b.prefs.ExitNodeIP.IsZero() {
-			exitNodeIP = b.prefs.ExitNodeIP
-		} else {
-			for _, bP := range b.netMap.Peers {
-				if bP.StableID == b.prefs.ExitNodeID {
-					if len(bP.Addresses) > 0 {
-						exitNodeIP = bP.Addresses[0].IP()
-					}
-					break
-				}
-			}
-		}
 		sb.AddPeer(p.Key, &ipnstate.PeerStatus{
 			InNetworkMap:   true,
 			ID:             p.StableID,
@@ -542,9 +519,8 @@ func (b *LocalBackend) populatePeerStatusLocked(sb *ipnstate.StatusBuilder) {
 			ShareeNode:     p.Hostinfo.ShareeNode(),
 			ExitNode:       p.StableID != "" && p.StableID == b.prefs.ExitNodeID,
 			ExitNodeOption: exitNodeOption,
-			//TODO(warrick): Confirm this updates ps correctly or updates don't filter
-			ExitNodeIP:   exitNodeIP,
-			SSH_HostKeys: p.Hostinfo.SSH_HostKeys().AsSlice(),
+			ExitNodeIP:     b.exitNodeIP(),
+			SSH_HostKeys:   p.Hostinfo.SSH_HostKeys().AsSlice(),
 		})
 	}
 }
