@@ -100,9 +100,6 @@ type Prefs struct {
 	ExitNodeID tailcfg.StableNodeID
 	ExitNodeIP netaddr.IP
 
-	// ExitNodeHostname is the hostname of the exit node.
-	ExitNodeHostname string
-
 	// ExitNodeAllowLANAccess indicates whether locally accessible subnets should be
 	// routed directly or via the exit node.
 	ExitNodeAllowLANAccess bool
@@ -605,10 +602,11 @@ func (p *Prefs) SetExitNodeIP(s string, st *ipnstate.Status) error {
 		p.ExitNodeIP = ip
 	}
 	// TODO(warrick): verify that ExitNodeID case doesn't need an hname grab
-	hname, err := exitNodeHNameOfArg(st, ip)
-	if err == nil {
-		p.ExitNodeHostname = hname
-	}
+	//hname, err := exitNodeHNameOfArg(st, ip)
+	//if err == nil {
+	//p.ExitNodeHostname = hname
+
+	//}
 	return err
 }
 

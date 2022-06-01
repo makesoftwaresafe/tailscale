@@ -41,7 +41,6 @@ func TestPrefsEqual(t *testing.T) {
 		"AllowSingleHosts",
 		"ExitNodeID",
 		"ExitNodeIP",
-		"ExitNodeHostname",
 		"ExitNodeAllowLANAccess",
 		"CorpDNS",
 		"RunSSH",
