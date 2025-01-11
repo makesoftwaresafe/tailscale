@@ -12,13 +12,22 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"tailscale.com/util/testenv"
 )
 
 var (
-	riskTypes   []string
-	riskLoseSSH = registerRiskType("lose-ssh")
-	riskAll     = registerRiskType("all")
+	riskTypes           []string
+	riskLoseSSH         = registerRiskType("lose-ssh")
+	riskMacAppConnector = registerRiskType("mac-app-connector")
+	riskAll             = registerRiskType("all")
 )
+
+const riskMacAppConnectorMessage = `
+You are trying to configure an app connector on macOS, which is not officially supported due to system limitations. This may result in performance and reliability issues. 
+
+Do not use a macOS app connector for any mission-critical purposes. For the best experience, Linux is the only recommended platform for app connectors.
+`
 
 func registerRiskType(riskType string) string {
 	riskTypes = append(riskTypes, riskType)
@@ -56,7 +65,7 @@ func presentRiskToUser(riskType, riskMessage, acceptedRisks string) error {
 	if isRiskAccepted(riskType, acceptedRisks) {
 		return nil
 	}
-	if inTest() {
+	if testenv.InTest() {
 		return errAborted
 	}
 	outln(riskMessage)
@@ -68,7 +77,7 @@ func presentRiskToUser(riskType, riskMessage, acceptedRisks string) error {
 	for left := riskAbortTimeSeconds; left > 0; left-- {
 		msg := fmt.Sprintf("\rContinuing in %d seconds...", left)
 		msgLen = len(msg)
-		printf(msg)
+		printf("%s", msg)
 		select {
 		case <-interrupt:
 			printf("\r%s\r", strings.Repeat("x", msgLen+1))

@@ -14,7 +14,7 @@ import (
 
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
-	"tailscale.com/types/key"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
 )
 
@@ -35,16 +35,19 @@ func startMesh(s *derp.Server) error {
 
 func startMeshWithHost(s *derp.Server, host string) error {
 	logf := logger.WithPrefix(log.Printf, fmt.Sprintf("mesh(%q): ", host))
-	c, err := derphttp.NewClient(s.PrivateKey(), "https://"+host+"/derp", logf)
+	netMon := netmon.NewStatic() // good enough for cmd/derper; no need for netns fanciness
+	c, err := derphttp.NewClient(s.PrivateKey(), "https://"+host+"/derp", logf, netMon)
 	if err != nil {
 		return err
 	}
 	c.MeshKey = s.MeshKey()
+	c.WatchConnectionChanges = true
 
 	// For meshed peers within a region, connect via VPC addresses.
 	c.SetURLDialer(func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
+			logf("failed to split %q: %v", addr, err)
 			return nil, err
 		}
 		var d net.Dialer
@@ -53,22 +56,25 @@ func startMeshWithHost(s *derp.Server, host string) error {
 			subCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			defer cancel()
 			vpcHost := base + "-vpc.tailscale.com"
-			ips, _ := r.LookupIP(subCtx, "ip", vpcHost)
+			ips, err := r.LookupIP(subCtx, "ip", vpcHost)
+			if err != nil {
+				logf("failed to resolve %v: %v", vpcHost, err)
+			}
 			if len(ips) > 0 {
 				vpcAddr := net.JoinHostPort(ips[0].String(), port)
 				c, err := d.DialContext(subCtx, network, vpcAddr)
 				if err == nil {
-					log.Printf("connected to %v (%v) instead of %v", vpcHost, ips[0], base)
+					logf("connected to %v (%v) instead of %v", vpcHost, ips[0], base)
 					return c, nil
 				}
-				log.Printf("failed to connect to %v (%v): %v; trying non-VPC route", vpcHost, ips[0], err)
+				logf("failed to connect to %v (%v): %v; trying non-VPC route", vpcHost, ips[0], err)
 			}
 		}
 		return d.DialContext(ctx, network, addr)
 	})
 
-	add := func(k key.NodePublic) { s.AddPacketForwarder(k, c) }
-	remove := func(k key.NodePublic) { s.RemovePacketForwarder(k, c) }
+	add := func(m derp.PeerPresentMessage) { s.AddPacketForwarder(m.Key, c) }
+	remove := func(m derp.PeerGoneMessage) { s.RemovePacketForwarder(m.Peer, c) }
 	go c.RunWatchConnectionLoop(context.Background(), s.PublicKey(), logf, add, remove)
 	return nil
 }

@@ -5,14 +5,15 @@ package router
 
 import (
 	"github.com/tailscale/wireguard-go/tun"
+	"tailscale.com/health"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
-	"tailscale.com/wgengine/monitor"
 )
 
-func newUserspaceRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor.Mon) (Router, error) {
-	return newUserspaceBSDRouter(logf, tundev, linkMon)
+func newUserspaceRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor, health *health.Tracker) (Router, error) {
+	return newUserspaceBSDRouter(logf, tundev, netMon, health)
 }
 
-func cleanup(logger.Logf, string) {
+func cleanUp(logger.Logf, string) {
 	// Nothing to do.
 }

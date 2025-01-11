@@ -15,6 +15,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	dns "golang.org/x/net/dns/dnsmessage"
+	"tailscale.com/health"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tstest"
 	"tailscale.com/util/dnsname"
@@ -87,7 +89,7 @@ func TestDNSOverTCP(t *testing.T) {
 			SearchDomains: fqdns("coffee.shop"),
 		},
 	}
-	m := NewManager(t.Logf, &f, nil, new(tsdial.Dialer), nil)
+	m := NewManager(t.Logf, &f, new(health.Tracker), tsdial.NewDialer(netmon.NewStatic()), nil, nil, "")
 	m.resolver.TestOnlySetHook(f.SetResolver)
 	m.Set(Config{
 		Hosts: hosts(
@@ -108,14 +110,14 @@ func TestDNSOverTCP(t *testing.T) {
 		"bradfitz.ts.com.": "2.3.4.5",
 	}
 
-	for domain, _ := range wantResults {
+	for domain := range wantResults {
 		b := mkDNSRequest(domain, dns.TypeA, addEDNS)
 		binary.Write(c, binary.BigEndian, uint16(len(b)))
 		c.Write(b)
 	}
 
 	results := map[dnsname.FQDN]string{}
-	for i := 0; i < len(wantResults); i++ {
+	for range len(wantResults) {
 		var respLength uint16
 		if err := binary.Read(c, binary.BigEndian, &respLength); err != nil {
 			t.Fatalf("reading len: %v", err)
@@ -172,7 +174,7 @@ func TestDNSOverTCP_TooLarge(t *testing.T) {
 			SearchDomains: fqdns("coffee.shop"),
 		},
 	}
-	m := NewManager(log, &f, nil, new(tsdial.Dialer), nil)
+	m := NewManager(log, &f, new(health.Tracker), tsdial.NewDialer(netmon.NewStatic()), nil, nil, "")
 	m.resolver.TestOnlySetHook(f.SetResolver)
 	m.Set(Config{
 		Hosts:         hosts("andrew.ts.com.", "1.2.3.4"),

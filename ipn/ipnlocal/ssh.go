@@ -20,14 +20,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 
 	"github.com/tailscale/golang-x-crypto/ssh"
 	"go4.org/mem"
-	"golang.org/x/exp/slices"
 	"tailscale.com/tailcfg"
-	"tailscale.com/util/lineread"
+	"tailscale.com/util/lineiter"
 	"tailscale.com/util/mak"
 )
 
@@ -80,30 +80,32 @@ func (b *LocalBackend) getSSHUsernames(req *tailcfg.C2NSSHUsernamesRequest) (*ta
 		if err != nil {
 			return nil, err
 		}
-		lineread.Reader(bytes.NewReader(out), func(line []byte) error {
+		for line := range lineiter.Bytes(out) {
 			line = bytes.TrimSpace(line)
 			if len(line) == 0 || line[0] == '_' {
-				return nil
+				continue
 			}
 			add(string(line))
-			return nil
-		})
+		}
 	default:
-		lineread.File("/etc/passwd", func(line []byte) error {
+		for lr := range lineiter.File("/etc/passwd") {
+			line, err := lr.Value()
+			if err != nil {
+				break
+			}
 			line = bytes.TrimSpace(line)
 			if len(line) == 0 || line[0] == '#' || line[0] == '_' {
-				return nil
+				continue
 			}
 			if mem.HasSuffix(mem.B(line), mem.S("/nologin")) ||
 				mem.HasSuffix(mem.B(line), mem.S("/false")) {
-				return nil
+				continue
 			}
 			colon := bytes.IndexByte(line, ':')
 			if colon != -1 {
 				add(string(line[:colon]))
 			}
-			return nil
-		})
+		}
 	}
 	return res, nil
 }
@@ -210,10 +212,23 @@ func (b *LocalBackend) getSystemSSH_HostKeys() (ret map[string]ssh.Signer) {
 	return ret
 }
 
-func (b *LocalBackend) getSSHHostKeyPublicStrings() (ret []string) {
-	signers, _ := b.GetSSH_HostKeys()
-	for _, signer := range signers {
-		ret = append(ret, strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))))
+func (b *LocalBackend) getSSHHostKeyPublicStrings() ([]string, error) {
+	signers, err := b.GetSSH_HostKeys()
+	if err != nil {
+		return nil, err
 	}
-	return ret
+	var keyStrings []string
+	for _, signer := range signers {
+		keyStrings = append(keyStrings, strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))))
+	}
+	return keyStrings, nil
+}
+
+// tailscaleSSHEnabled reports whether Tailscale SSH is currently enabled based
+// on prefs. It returns false if there are no prefs set.
+func (b *LocalBackend) tailscaleSSHEnabled() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	p := b.pm.CurrentPrefs()
+	return p.Valid() && p.RunSSH()
 }

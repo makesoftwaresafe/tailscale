@@ -29,8 +29,6 @@ var _PersistCloneNeedsRegeneration = Persist(struct {
 	LegacyFrontendPrivateMachineKey key.MachinePrivate
 	PrivateNodeKey                  key.NodePrivate
 	OldPrivateNodeKey               key.NodePrivate
-	Provider                        string
-	LoginName                       string
 	UserProfile                     tailcfg.UserProfile
 	NetworkLockKey                  key.NLPrivate
 	NodeID                          tailcfg.StableNodeID

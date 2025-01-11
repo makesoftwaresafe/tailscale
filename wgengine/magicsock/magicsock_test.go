@@ -22,34 +22,51 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
 
+	qt "github.com/frankban/quicktest"
 	wgconn "github.com/tailscale/wireguard-go/conn"
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun/tuntest"
 	"go4.org/mem"
-	"golang.org/x/exp/maps"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
 	"tailscale.com/cmd/testwrapper/flakytest"
+	"tailscale.com/control/controlknobs"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/disco"
+	"tailscale.com/envknob"
+	"tailscale.com/health"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/connstats"
 	"tailscale.com/net/netaddr"
+	"tailscale.com/net/netcheck"
+	"tailscale.com/net/netmon"
+	"tailscale.com/net/packet"
+	"tailscale.com/net/ping"
 	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/tstest/natlab"
+	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netlogtype"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/nettype"
+	"tailscale.com/types/ptr"
 	"tailscale.com/util/cibuild"
+	"tailscale.com/util/must"
 	"tailscale.com/util/racebuild"
+	"tailscale.com/util/set"
+	"tailscale.com/util/slicesx"
+	"tailscale.com/util/usermetric"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/wgcfg"
 	"tailscale.com/wgengine/wgcfg/nmcfg"
@@ -141,6 +158,8 @@ type magicStack struct {
 	tsTun      *tstun.Wrapper          // wrapped tun that implements filtering and wgengine hooks
 	dev        *device.Device          // the wireguard-go Device that connects the previous things
 	wgLogger   *wglog.Logger           // wireguard-go log wrapper
+	netMon     *netmon.Monitor         // always non-nil
+	metrics    *usermetric.Registry
 }
 
 // newMagicStack builds and initializes an idle magicsock and
@@ -154,9 +173,20 @@ func newMagicStack(t testing.TB, logf logger.Logf, l nettype.PacketListener, der
 func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListener, derpMap *tailcfg.DERPMap, privateKey key.NodePrivate) *magicStack {
 	t.Helper()
 
+	netMon, err := netmon.New(logf)
+	if err != nil {
+		t.Fatalf("netmon.New: %v", err)
+	}
+	ht := new(health.Tracker)
+
+	var reg usermetric.Registry
 	epCh := make(chan []tailcfg.Endpoint, 100) // arbitrary
 	conn, err := NewConn(Options{
+		NetMon:                 netMon,
+		Metrics:                &reg,
 		Logf:                   logf,
+		HealthTracker:          ht,
+		DisablePortMapper:      true,
 		TestOnlyPacketListener: l,
 		EndpointsFunc: func(eps []tailcfg.Endpoint) {
 			epCh <- eps
@@ -171,8 +201,9 @@ func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListen
 	}
 
 	tun := tuntest.NewChannelTUN()
-	tsTun := tstun.Wrap(logf, tun.TUN())
+	tsTun := tstun.Wrap(logf, tun.TUN(), &reg)
 	tsTun.SetFilter(filter.NewAllowAllForTest(logf))
+	tsTun.Start()
 
 	wgLogger := wglog.NewLogger(logf)
 	dev := wgcfg.NewDevice(tsTun, conn.Bind(), wgLogger.DeviceLogger)
@@ -195,10 +226,13 @@ func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListen
 		tsTun:      tsTun,
 		dev:        dev,
 		wgLogger:   wgLogger,
+		netMon:     netMon,
+		metrics:    &reg,
 	}
 }
 
 func (s *magicStack) Reconfig(cfg *wgcfg.Config) error {
+	s.tsTun.SetWGConfig(cfg)
 	s.wgLogger.SetPeers(cfg.Peers)
 	return wgcfg.ReconfigDevice(s.dev, cfg, s.conn.logf)
 }
@@ -211,12 +245,15 @@ func (s *magicStack) String() string {
 func (s *magicStack) Close() {
 	s.dev.Close()
 	s.conn.Close()
+	s.netMon.Close()
 }
 
 func (s *magicStack) Public() key.NodePublic {
 	return s.privateKey.Public()
 }
 
+// Status returns a subset of the ipnstate.Status, only involving
+// the magicsock-specific parts.
 func (s *magicStack) Status() *ipnstate.Status {
 	var sb ipnstate.StatusBuilder
 	sb.WantPeers = true
@@ -231,9 +268,11 @@ func (s *magicStack) Status() *ipnstate.Status {
 // address. See meshStacks for one possible source of netmaps and IPs.
 func (s *magicStack) IP() netip.Addr {
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-		st := s.Status()
-		if len(st.TailscaleIPs) > 0 {
-			return st.TailscaleIPs[0]
+		s.conn.mu.Lock()
+		addr := s.conn.firstAddrForTest
+		s.conn.mu.Unlock()
+		if addr.IsValid() {
+			return addr
 		}
 	}
 	panic("timed out waiting for magicstack to get an IP assigned")
@@ -258,7 +297,9 @@ func meshStacks(logf logger.Logf, mutateNetmap func(idx int, nm *netmap.NetworkM
 		nm := &netmap.NetworkMap{
 			PrivateKey: me.privateKey,
 			NodeKey:    me.privateKey.Public(),
-			Addresses:  []netip.Prefix{netip.PrefixFrom(netaddr.IPv4(1, 0, 0, byte(myIdx+1)), 32)},
+			SelfNode: (&tailcfg.Node{
+				Addresses: []netip.Prefix{netip.PrefixFrom(netaddr.IPv4(1, 0, 0, byte(myIdx+1)), 32)},
+			}).View(),
 		}
 		for i, peer := range ms {
 			if i == myIdx {
@@ -272,10 +313,10 @@ func meshStacks(logf logger.Logf, mutateNetmap func(idx int, nm *netmap.NetworkM
 				DiscoKey:   peer.conn.DiscoPublicKey(),
 				Addresses:  addrs,
 				AllowedIPs: addrs,
-				Endpoints:  epStrings(eps[i]),
+				Endpoints:  epFromTyped(eps[i]),
 				DERP:       "127.3.3.40:1",
 			}
-			nm.Peers = append(nm.Peers, peer)
+			nm.Peers = append(nm.Peers, peer.View())
 		}
 
 		if mutateNetmap != nil {
@@ -293,12 +334,12 @@ func meshStacks(logf logger.Logf, mutateNetmap func(idx int, nm *netmap.NetworkM
 		for i, m := range ms {
 			nm := buildNetmapLocked(i)
 			m.conn.SetNetworkMap(nm)
-			peerSet := make(map[key.NodePublic]struct{}, len(nm.Peers))
+			peerSet := make(set.Set[key.NodePublic], len(nm.Peers))
 			for _, peer := range nm.Peers {
-				peerSet[peer.Key] = struct{}{}
+				peerSet.Add(peer.Key())
 			}
 			m.conn.UpdatePeers(peerSet)
-			wg, err := nmcfg.WGCfg(nm, logf, netmap.AllowSingleHosts, "")
+			wg, err := nmcfg.WGCfg(nm, logf, 0, "")
 			if err != nil {
 				// We're too far from the *testing.T to be graceful,
 				// blow up. Shouldn't happen anyway.
@@ -349,14 +390,23 @@ func TestNewConn(t *testing.T) {
 		}
 	}
 
+	netMon, err := netmon.New(logger.WithPrefix(t.Logf, "... netmon: "))
+	if err != nil {
+		t.Fatalf("netmon.New: %v", err)
+	}
+	defer netMon.Close()
+
 	stunAddr, stunCleanupFn := stuntest.Serve(t)
 	defer stunCleanupFn()
 
 	port := pickPort(t)
 	conn, err := NewConn(Options{
-		Port:          port,
-		EndpointsFunc: epFunc,
-		Logf:          t.Logf,
+		Port:              port,
+		DisablePortMapper: true,
+		EndpointsFunc:     epFunc,
+		Logf:              t.Logf,
+		NetMon:            netMon,
+		Metrics:           new(usermetric.Registry),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -370,8 +420,9 @@ func TestNewConn(t *testing.T) {
 		sizes := make([]int, 1)
 		eps := make([]wgconn.Endpoint, 1)
 		pkts[0] = make([]byte, 64<<10)
+		receiveIPv4 := conn.receiveIPv4()
 		for {
-			_, err := conn.receiveIPv4(pkts, sizes, eps)
+			_, err := receiveIPv4(pkts, sizes, eps)
 			if err != nil {
 				return
 			}
@@ -385,6 +436,7 @@ collectEndpoints:
 	for {
 		select {
 		case ep := <-epCh:
+			t.Logf("TestNewConn: got endpoint: %v", ep)
 			endpoints = append(endpoints, ep)
 			if strings.HasSuffix(ep, suffix) {
 				break collectEndpoints
@@ -409,7 +461,7 @@ func TestPickDERPFallback(t *testing.T) {
 	tstest.PanicOnLog()
 	tstest.ResourceCheck(t)
 
-	c := newConn()
+	c := newConn(t.Logf)
 	dm := &tailcfg.DERPMap{
 		Regions: map[int]*tailcfg.DERPRegion{
 			1: {},
@@ -429,7 +481,7 @@ func TestPickDERPFallback(t *testing.T) {
 	}
 
 	// Test that it's consistent.
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		b := c.pickDERPFallback()
 		if a != b {
 			t.Fatalf("got inconsistent %d vs %d values", a, b)
@@ -439,8 +491,8 @@ func TestPickDERPFallback(t *testing.T) {
 	// Test that that the pointer value of c is blended in and
 	// distribution over nodes works.
 	got := map[int]int{}
-	for i := 0; i < 50; i++ {
-		c = newConn()
+	for range 50 {
+		c = newConn(t.Logf)
 		c.derpMap = dm
 		got[c.pickDERPFallback()]++
 	}
@@ -471,9 +523,17 @@ func TestDeviceStartStop(t *testing.T) {
 	tstest.PanicOnLog()
 	tstest.ResourceCheck(t)
 
+	netMon, err := netmon.New(logger.WithPrefix(t.Logf, "... netmon: "))
+	if err != nil {
+		t.Fatalf("netmon.New: %v", err)
+	}
+	defer netMon.Close()
+
 	conn, err := NewConn(Options{
 		EndpointsFunc: func(eps []tailcfg.Endpoint) {},
 		Logf:          t.Logf,
+		NetMon:        netMon,
+		Metrics:       new(usermetric.Registry),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -602,7 +662,7 @@ func (localhostListener) ListenPacket(ctx context.Context, network, address stri
 }
 
 func TestTwoDevicePing(t *testing.T) {
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/1277")
+	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/11762")
 	l, ip := localhostListener{}, netaddr.IPv4(127, 0, 0, 1)
 	n := &devices{
 		m1:     l,
@@ -646,7 +706,9 @@ func TestDiscokeyChange(t *testing.T) {
 		}
 		mu.Lock()
 		defer mu.Unlock()
-		nm.Peers[0].DiscoKey = m1DiscoKey
+		mut := nm.Peers[0].AsStruct()
+		mut.DiscoKey = m1DiscoKey
+		nm.Peers[0] = mut.View()
 	}
 
 	cleanupMesh := meshStacks(t.Logf, setm1Key, m1, m2)
@@ -683,6 +745,8 @@ func TestDiscokeyChange(t *testing.T) {
 }
 
 func TestActiveDiscovery(t *testing.T) {
+	tstest.ResourceCheck(t)
+
 	t.Run("simple_internet", func(t *testing.T) {
 		t.Parallel()
 		mstun := &natlab.Machine{Name: "stun"}
@@ -878,7 +942,6 @@ func newPinger(t *testing.T, logf logger.Logf, src, dst *magicStack) (cleanup fu
 // get exercised.
 func testActiveDiscovery(t *testing.T, d *devices) {
 	tstest.PanicOnLog()
-	tstest.ResourceCheck(t)
 
 	tlogf, setT := makeNestable(t)
 	setT(t)
@@ -1070,7 +1133,7 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 			}
 		}
 		t.Helper()
-		t.Errorf("missing any connection to %s from %s", wantConns, maps.Keys(stats))
+		t.Errorf("missing any connection to %s from %s", wantConns, slicesx.MapKeys(stats))
 	}
 
 	addrPort := netip.MustParseAddrPort
@@ -1129,11 +1192,95 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 		checkStats(t, m1, m1Conns)
 		checkStats(t, m2, m2Conns)
 	})
+	t.Run("compare-metrics-stats", func(t *testing.T) {
+		setT(t)
+		defer setT(outerT)
+		m1.conn.resetMetricsForTest()
+		m1.stats.TestExtract()
+		m2.conn.resetMetricsForTest()
+		m2.stats.TestExtract()
+		t.Logf("Metrics before: %s\n", m1.metrics.String())
+		ping1(t)
+		ping2(t)
+		assertConnStatsAndUserMetricsEqual(t, m1)
+		assertConnStatsAndUserMetricsEqual(t, m2)
+		t.Logf("Metrics after: %s\n", m1.metrics.String())
+	})
+}
+
+func (c *Conn) resetMetricsForTest() {
+	c.metrics.inboundBytesIPv4Total.Set(0)
+	c.metrics.inboundPacketsIPv4Total.Set(0)
+	c.metrics.outboundBytesIPv4Total.Set(0)
+	c.metrics.outboundPacketsIPv4Total.Set(0)
+	c.metrics.inboundBytesIPv6Total.Set(0)
+	c.metrics.inboundPacketsIPv6Total.Set(0)
+	c.metrics.outboundBytesIPv6Total.Set(0)
+	c.metrics.outboundPacketsIPv6Total.Set(0)
+	c.metrics.inboundBytesDERPTotal.Set(0)
+	c.metrics.inboundPacketsDERPTotal.Set(0)
+	c.metrics.outboundBytesDERPTotal.Set(0)
+	c.metrics.outboundPacketsDERPTotal.Set(0)
+}
+
+func assertConnStatsAndUserMetricsEqual(t *testing.T, ms *magicStack) {
+	_, phys := ms.stats.TestExtract()
+
+	physIPv4RxBytes := int64(0)
+	physIPv4TxBytes := int64(0)
+	physDERPRxBytes := int64(0)
+	physDERPTxBytes := int64(0)
+	physIPv4RxPackets := int64(0)
+	physIPv4TxPackets := int64(0)
+	physDERPRxPackets := int64(0)
+	physDERPTxPackets := int64(0)
+	for conn, count := range phys {
+		t.Logf("physconn src: %s, dst: %s", conn.Src.String(), conn.Dst.String())
+		if conn.Dst.String() == "127.3.3.40:1" {
+			physDERPRxBytes += int64(count.RxBytes)
+			physDERPTxBytes += int64(count.TxBytes)
+			physDERPRxPackets += int64(count.RxPackets)
+			physDERPTxPackets += int64(count.TxPackets)
+		} else {
+			physIPv4RxBytes += int64(count.RxBytes)
+			physIPv4TxBytes += int64(count.TxBytes)
+			physIPv4RxPackets += int64(count.RxPackets)
+			physIPv4TxPackets += int64(count.TxPackets)
+		}
+	}
+
+	metricIPv4RxBytes := ms.conn.metrics.inboundBytesIPv4Total.Value()
+	metricIPv4RxPackets := ms.conn.metrics.inboundPacketsIPv4Total.Value()
+	metricIPv4TxBytes := ms.conn.metrics.outboundBytesIPv4Total.Value()
+	metricIPv4TxPackets := ms.conn.metrics.outboundPacketsIPv4Total.Value()
+
+	metricDERPRxBytes := ms.conn.metrics.inboundBytesDERPTotal.Value()
+	metricDERPRxPackets := ms.conn.metrics.inboundPacketsDERPTotal.Value()
+	metricDERPTxBytes := ms.conn.metrics.outboundBytesDERPTotal.Value()
+	metricDERPTxPackets := ms.conn.metrics.outboundPacketsDERPTotal.Value()
+
+	c := qt.New(t)
+	c.Assert(physDERPRxBytes, qt.Equals, metricDERPRxBytes)
+	c.Assert(physDERPTxBytes, qt.Equals, metricDERPTxBytes)
+	c.Assert(physIPv4RxBytes, qt.Equals, metricIPv4RxBytes)
+	c.Assert(physIPv4TxBytes, qt.Equals, metricIPv4TxBytes)
+	c.Assert(physDERPRxPackets, qt.Equals, metricDERPRxPackets)
+	c.Assert(physDERPTxPackets, qt.Equals, metricDERPTxPackets)
+	c.Assert(physIPv4RxPackets, qt.Equals, metricIPv4RxPackets)
+	c.Assert(physIPv4TxPackets, qt.Equals, metricIPv4TxPackets)
+
+	// Validate that the usermetrics and clientmetrics are in sync
+	// Note: the clientmetrics are global, this means that when they are registering with the
+	// wgengine, multiple in-process nodes used by this test will be updating the same metrics. This is why we need to multiply
+	// the metrics by 2 to get the expected value.
+	// TODO(kradalby): https://github.com/tailscale/tailscale/issues/13420
+	c.Assert(metricSendUDP.Value(), qt.Equals, metricIPv4TxPackets*2)
+	c.Assert(metricRecvDataPacketsIPv4.Value(), qt.Equals, metricIPv4RxPackets*2)
+	c.Assert(metricRecvDataPacketsDERP.Value(), qt.Equals, metricDERPRxPackets*2)
 }
 
 func TestDiscoMessage(t *testing.T) {
-	c := newConn()
-	c.logf = t.Logf
+	c := newConn(t.Logf)
 	c.privateKey = key.NewNode()
 
 	peer1Pub := c.DiscoPublicKey()
@@ -1142,10 +1289,15 @@ func TestDiscoMessage(t *testing.T) {
 		Key:      key.NewNode().Public(),
 		DiscoKey: peer1Pub,
 	}
-	c.peerMap.upsertEndpoint(&endpoint{
+	ep := &endpoint{
+		nodeID:    1,
 		publicKey: n.Key,
-		discoKey:  n.DiscoKey,
-	}, key.DiscoPublic{})
+	}
+	ep.disco.Store(&endpointDisco{
+		key:   n.DiscoKey,
+		short: n.DiscoKey.ShortString(),
+	})
+	c.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
 
 	const payload = "why hello"
 
@@ -1156,7 +1308,7 @@ func TestDiscoMessage(t *testing.T) {
 
 	box := peer1Priv.Shared(c.discoPrivate.Public()).Seal([]byte(payload))
 	pkt = append(pkt, box...)
-	got := c.handleDiscoMessage(pkt, netip.AddrPort{}, key.NodePublic{})
+	got := c.handleDiscoMessage(pkt, netip.AddrPort{}, key.NodePublic{}, discoRXPathUDP)
 	if !got {
 		t.Error("failed to open it")
 	}
@@ -1191,15 +1343,15 @@ func Test32bitAlignment(t *testing.T) {
 		},
 	}
 
-	if off := unsafe.Offsetof(de.lastRecv); off%8 != 0 {
-		t.Fatalf("endpoint.lastRecv is not 8-byte aligned")
+	if off := unsafe.Offsetof(de.lastRecvWG); off%8 != 0 {
+		t.Fatalf("endpoint.lastRecvWG is not 8-byte aligned")
 	}
 
-	de.noteRecvActivity() // verify this doesn't panic on 32-bit
+	de.noteRecvActivity(netip.AddrPort{}, mono.Now()) // verify this doesn't panic on 32-bit
 	if called != 1 {
 		t.Fatal("expected call to noteRecvActivity")
 	}
-	de.noteRecvActivity()
+	de.noteRecvActivity(netip.AddrPort{}, mono.Now())
 	if called != 1 {
 		t.Error("expected no second call to noteRecvActivity")
 	}
@@ -1209,7 +1361,18 @@ func Test32bitAlignment(t *testing.T) {
 func newTestConn(t testing.TB) *Conn {
 	t.Helper()
 	port := pickPort(t)
+
+	netMon, err := netmon.New(logger.WithPrefix(t.Logf, "... netmon: "))
+	if err != nil {
+		t.Fatalf("netmon.New: %v", err)
+	}
+	t.Cleanup(func() { netMon.Close() })
+
 	conn, err := NewConn(Options{
+		NetMon:                 netMon,
+		HealthTracker:          new(health.Tracker),
+		Metrics:                new(usermetric.Registry),
+		DisablePortMapper:      true,
 		Logf:                   t.Logf,
 		Port:                   port,
 		TestOnlyPacketListener: localhostListener{},
@@ -1233,13 +1396,14 @@ func addTestEndpoint(tb testing.TB, conn *Conn, sendConn net.PacketConn) (key.No
 	discoKey := key.DiscoPublicFromRaw32(mem.B([]byte{31: 1}))
 	nodeKey := key.NodePublicFromRaw32(mem.B([]byte{0: 'N', 1: 'K', 31: 0}))
 	conn.SetNetworkMap(&netmap.NetworkMap{
-		Peers: []*tailcfg.Node{
+		Peers: nodeViews([]*tailcfg.Node{
 			{
+				ID:        1,
 				Key:       nodeKey,
 				DiscoKey:  discoKey,
-				Endpoints: []string{sendConn.LocalAddr().String()},
+				Endpoints: eps(sendConn.LocalAddr().String()),
 			},
-		},
+		}),
 	})
 	conn.SetPrivateKey(key.NodePrivateFromRaw32(mem.B([]byte{0: 1, 31: 0})))
 	_, err := conn.ParseEndpoint(nodeKey.UntypedHexString())
@@ -1276,11 +1440,12 @@ func setUpReceiveFrom(tb testing.TB) (roundTrip func()) {
 	buffs[0] = make([]byte, 2<<10)
 	sizes := make([]int, 1)
 	eps := make([]wgconn.Endpoint, 1)
+	receiveIPv4 := conn.receiveIPv4()
 	return func() {
 		if _, err := sendConn.WriteTo(sendBuf, dstAddr); err != nil {
 			tb.Fatalf("WriteTo: %v", err)
 		}
-		n, err := conn.receiveIPv4(buffs, sizes, eps)
+		n, err := receiveIPv4(buffs, sizes, eps)
 		if err != nil {
 			tb.Fatal(err)
 		}
@@ -1374,7 +1539,7 @@ func TestReceiveFromAllocs(t *testing.T) {
 
 func BenchmarkReceiveFrom(b *testing.B) {
 	roundTrip := setUpReceiveFrom(b)
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		roundTrip()
 	}
 }
@@ -1401,7 +1566,7 @@ func BenchmarkReceiveFrom_Native(b *testing.B) {
 	}
 
 	buf := make([]byte, 2<<10)
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		if _, err := sendConn.WriteTo(sendBuf, dstAddr); err != nil {
 			b.Fatalf("WriteTo: %v", err)
 		}
@@ -1409,6 +1574,14 @@ func BenchmarkReceiveFrom_Native(b *testing.B) {
 			b.Fatalf("ReadFromUDP: %v", err)
 		}
 	}
+}
+
+func nodeViews(v []*tailcfg.Node) []tailcfg.NodeView {
+	nv := make([]tailcfg.NodeView, len(v))
+	for i, n := range v {
+		nv[i] = n.View()
+	}
+	return nv
 }
 
 // Test that a netmap update where node changes its node key but
@@ -1428,28 +1601,30 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 	nodeKey2 := key.NodePublicFromRaw32(mem.B([]byte{0: 'N', 1: 'K', 2: '2', 31: 0}))
 
 	conn.SetNetworkMap(&netmap.NetworkMap{
-		Peers: []*tailcfg.Node{
+		Peers: nodeViews([]*tailcfg.Node{
 			{
+				ID:        1,
 				Key:       nodeKey1,
 				DiscoKey:  discoKey,
-				Endpoints: []string{"192.168.1.2:345"},
+				Endpoints: eps("192.168.1.2:345"),
 			},
-		},
+		}),
 	})
 	_, err := conn.ParseEndpoint(nodeKey1.UntypedHexString())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		conn.SetNetworkMap(&netmap.NetworkMap{
-			Peers: []*tailcfg.Node{
+			Peers: nodeViews([]*tailcfg.Node{
 				{
+					ID:        2,
 					Key:       nodeKey2,
 					DiscoKey:  discoKey,
-					Endpoints: []string{"192.168.1.2:345"},
+					Endpoints: eps("192.168.1.2:345"),
 				},
-			},
+			}),
 		})
 	}
 
@@ -1457,8 +1632,12 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 	if ok && de.publicKey != nodeKey2 {
 		t.Fatalf("discoEndpoint public key = %q; want %q", de.publicKey, nodeKey2)
 	}
-	if de.discoKey != discoKey {
-		t.Errorf("discoKey = %v; want %v", de.discoKey, discoKey)
+	deDisco := de.disco.Load()
+	if deDisco == nil {
+		t.Fatalf("discoEndpoint disco is nil")
+	}
+	if deDisco.key != discoKey {
+		t.Errorf("discoKey = %v; want %v", deDisco.key, discoKey)
 	}
 	if _, ok := conn.peerMap.endpointForNodeKey(nodeKey1); ok {
 		t.Errorf("didn't expect to find node for key1")
@@ -1501,8 +1680,9 @@ func TestRebindStress(t *testing.T) {
 		sizes := make([]int, 1)
 		eps := make([]wgconn.Endpoint, 1)
 		buffs[0] = make([]byte, 1500)
+		receiveIPv4 := conn.receiveIPv4()
 		for {
-			_, err := conn.receiveIPv4(buffs, sizes, eps)
+			_, err := receiveIPv4(buffs, sizes, eps)
 			if ctx.Err() != nil {
 				errc <- nil
 				return
@@ -1518,13 +1698,13 @@ func TestRebindStress(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 2000; i++ {
+		for range 2000 {
 			conn.Rebind()
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 2000; i++ {
+		for range 2000 {
 			conn.Rebind()
 		}
 	}()
@@ -1604,62 +1784,144 @@ func TestEndpointSetsEqual(t *testing.T) {
 
 func TestBetterAddr(t *testing.T) {
 	const ms = time.Millisecond
-	al := func(ipps string, d time.Duration) addrLatency {
-		return addrLatency{netip.MustParseAddrPort(ipps), d}
+	al := func(ipps string, d time.Duration) addrQuality {
+		return addrQuality{AddrPort: netip.MustParseAddrPort(ipps), latency: d}
 	}
-	zero := addrLatency{}
+	almtu := func(ipps string, d time.Duration, mtu tstun.WireMTU) addrQuality {
+		return addrQuality{AddrPort: netip.MustParseAddrPort(ipps), latency: d, wireMTU: mtu}
+	}
+	zero := addrQuality{}
+
+	const (
+		publicV4   = "1.2.3.4:555"
+		publicV4_2 = "5.6.7.8:999"
+		publicV6   = "[2001::5]:123"
+
+		privateV4 = "10.0.0.2:123"
+	)
+
 	tests := []struct {
-		a, b addrLatency
-		want bool
+		a, b addrQuality
+		want bool // whether a is better than b
 	}{
 		{a: zero, b: zero, want: false},
-		{a: al("10.0.0.2:123", 5*ms), b: zero, want: true},
-		{a: zero, b: al("10.0.0.2:123", 5*ms), want: false},
-		{a: al("10.0.0.2:123", 5*ms), b: al("1.2.3.4:555", 6*ms), want: true},
-		{a: al("10.0.0.2:123", 5*ms), b: al("10.0.0.2:123", 10*ms), want: false}, // same IPPort
+		{a: al(publicV4, 5*ms), b: zero, want: true},
+		{a: zero, b: al(publicV4, 5*ms), want: false},
+		{a: al(publicV4, 5*ms), b: al(publicV4_2, 10*ms), want: true},
+		{a: al(publicV4, 5*ms), b: al(publicV4, 10*ms), want: false}, // same IPPort
 
-		// Prefer IPv6 if roughly equivalent:
+		// Don't prefer b to a if it's not substantially better.
+		{a: al(publicV4, 100*ms), b: al(publicV4_2, 100*ms), want: false},
+		{a: al(publicV4, 100*ms), b: al(publicV4_2, 101*ms), want: false},
+		{a: al(publicV4, 100*ms), b: al(publicV4_2, 103*ms), want: true},
+
+		// Latencies of zero don't result in a divide-by-zero
+		{a: al(publicV4, 0), b: al(publicV4_2, 0), want: false},
+
+		// Prefer private IPs to public IPs if roughly equivalent...
 		{
-			a:    al("[2001::5]:123", 100*ms),
-			b:    al("1.2.3.4:555", 91*ms),
+			a:    al(privateV4, 100*ms),
+			b:    al(publicV4, 91*ms),
 			want: true,
 		},
 		{
-			a:    al("1.2.3.4:555", 91*ms),
-			b:    al("[2001::5]:123", 100*ms),
+			a:    al(publicV4, 91*ms),
+			b:    al(privateV4, 100*ms),
+			want: false,
+		},
+		// ... but not if the private IP is slower.
+		{
+			a:    al(privateV4, 100*ms),
+			b:    al(publicV4, 30*ms),
+			want: false,
+		},
+		{
+			a:    al(publicV4, 30*ms),
+			b:    al(privateV4, 100*ms),
+			want: true,
+		},
+
+		// Prefer IPv6 if roughly equivalent:
+		{
+			a:    al(publicV6, 100*ms),
+			b:    al(publicV4, 91*ms),
+			want: true,
+		},
+		{
+			a:    al(publicV4, 91*ms),
+			b:    al(publicV6, 100*ms),
 			want: false,
 		},
 		// But not if IPv4 is much faster:
 		{
-			a:    al("[2001::5]:123", 100*ms),
-			b:    al("1.2.3.4:555", 30*ms),
+			a:    al(publicV6, 100*ms),
+			b:    al(publicV4, 30*ms),
 			want: false,
 		},
 		{
-			a:    al("1.2.3.4:555", 30*ms),
-			b:    al("[2001::5]:123", 100*ms),
+			a:    al(publicV4, 30*ms),
+			b:    al(publicV6, 100*ms),
 			want: true,
 		},
+		// If addresses are equal, prefer larger MTU
+		{
+			a:    almtu(publicV4, 30*ms, 1500),
+			b:    almtu(publicV4, 30*ms, 0),
+			want: true,
+		},
+		// Private IPs are preferred over public IPs even if the public
+		// IP is IPv6.
+		{
+			a:    al("192.168.0.1:555", 100*ms),
+			b:    al("[2001::5]:123", 101*ms),
+			want: true,
+		},
+		{
+			a:    al("[2001::5]:123", 101*ms),
+			b:    al("192.168.0.1:555", 100*ms),
+			want: false,
+		},
+
+		// Link-local unicast addresses are preferred over other
+		// private IPs, but not as much as localhost addresses.
+		{
+			a:    al("[fe80::ce8:474a:a27e:113b]:555", 101*ms),
+			b:    al("[fd89:1a8a:8888:9999:aaaa:bbbb:cccc:dddd]:555", 100*ms),
+			want: true,
+		},
+		{
+			a:    al("[fe80::ce8:474a:a27e:113b]:555", 101*ms),
+			b:    al("[::1]:555", 100*ms),
+			want: false,
+		},
 	}
-	for _, tt := range tests {
+	for i, tt := range tests {
 		got := betterAddr(tt.a, tt.b)
 		if got != tt.want {
-			t.Errorf("betterAddr(%+v, %+v) = %v; want %v", tt.a, tt.b, got, tt.want)
+			t.Errorf("[%d] betterAddr(%+v, %+v) = %v; want %v", i, tt.a, tt.b, got, tt.want)
 			continue
 		}
 		gotBack := betterAddr(tt.b, tt.a)
 		if got && gotBack {
-			t.Errorf("betterAddr(%+v, %+v) and betterAddr(%+v, %+v) both unexpectedly true", tt.a, tt.b, tt.b, tt.a)
+			t.Errorf("[%d] betterAddr(%+v, %+v) and betterAddr(%+v, %+v) both unexpectedly true", i, tt.a, tt.b, tt.b, tt.a)
 		}
 	}
 
 }
 
-func epStrings(eps []tailcfg.Endpoint) (ret []string) {
+func epFromTyped(eps []tailcfg.Endpoint) (ret []netip.AddrPort) {
 	for _, ep := range eps {
-		ret = append(ret, ep.Addr.String())
+		ret = append(ret, ep.Addr)
 	}
 	return
+}
+
+func eps(s ...string) []netip.AddrPort {
+	var eps []netip.AddrPort
+	for _, ep := range s {
+		eps = append(eps, netip.MustParseAddrPort(ep))
+	}
+	return eps
 }
 
 func TestStressSetNetworkMap(t *testing.T) {
@@ -1678,9 +1940,10 @@ func TestStressSetNetworkMap(t *testing.T) {
 	for i := range allPeers {
 		present[i] = true
 		allPeers[i] = &tailcfg.Node{
+			ID:        tailcfg.NodeID(i) + 1,
 			DiscoKey:  randDiscoKey(),
 			Key:       randNodeKey(),
-			Endpoints: []string{fmt.Sprintf("192.168.1.2:%d", i)},
+			Endpoints: eps(fmt.Sprintf("192.168.1.2:%d", i)),
 		}
 	}
 
@@ -1695,7 +1958,7 @@ func TestStressSetNetworkMap(t *testing.T) {
 	prng := rand.New(rand.NewSource(int64(seed)))
 
 	const iters = 1000 // approx 0.5s on an m1 mac
-	for i := 0; i < iters; i++ {
+	for range iters {
 		for j := 0; j < npeers; j++ {
 			// Randomize which peers are present.
 			if prng.Int()&1 == 0 {
@@ -1718,7 +1981,7 @@ func TestStressSetNetworkMap(t *testing.T) {
 		}
 		// Set the netmap.
 		conn.SetNetworkMap(&netmap.NetworkMap{
-			Peers: peers,
+			Peers: nodeViews(peers),
 		})
 		// Check invariants.
 		if err := conn.peerMap.validate(); err != nil {
@@ -1742,18 +2005,26 @@ func (m *peerMap) validate() error {
 			return fmt.Errorf("duplicate endpoint present: %v", pi.ep.publicKey)
 		}
 		seenEps[pi.ep] = true
-		for ipp, v := range pi.ipPorts {
-			if !v {
-				return fmt.Errorf("m.byIPPort[%v] is false, expected map to be set-like", ipp)
-			}
+		for ipp := range pi.ipPorts {
 			if got := m.byIPPort[ipp]; got != pi {
 				return fmt.Errorf("m.byIPPort[%v] = %v, want %v", ipp, got, pi)
 			}
 		}
 	}
+	if len(m.byNodeKey) != len(m.byNodeID) {
+		return fmt.Errorf("len(m.byNodeKey)=%d != len(m.byNodeID)=%d", len(m.byNodeKey), len(m.byNodeID))
+	}
+	for nodeID, pi := range m.byNodeID {
+		ep := pi.ep
+		if pi2, ok := m.byNodeKey[ep.publicKey]; !ok {
+			return fmt.Errorf("nodeID %d in map with publicKey %v that's missing from map", nodeID, ep.publicKey)
+		} else if pi2 != pi {
+			return fmt.Errorf("nodeID %d in map with publicKey %v that points to different endpoint", nodeID, ep.publicKey)
+		}
+	}
 
 	for ipp, pi := range m.byIPPort {
-		if !pi.ipPorts[ipp] {
+		if !pi.ipPorts.Contains(ipp) {
 			return fmt.Errorf("ipPorts[%v] for %v is false", ipp, pi.ep.publicKey)
 		}
 		pi2 := m.byNodeKey[pi.ep.publicKey]
@@ -1764,10 +2035,7 @@ func (m *peerMap) validate() error {
 
 	publicToDisco := make(map[key.NodePublic]key.DiscoPublic)
 	for disco, nodes := range m.nodesOfDisco {
-		for pub, v := range nodes {
-			if !v {
-				return fmt.Errorf("m.nodeOfDisco[%v][%v] is false, expected map to be set-like", disco, pub)
-			}
+		for pub := range nodes {
 			if _, ok := m.byNodeKey[pub]; !ok {
 				return fmt.Errorf("nodesOfDisco refers to public key %v, which is not present in byNodeKey", pub)
 			}
@@ -1786,7 +2054,7 @@ func TestBlockForeverConnUnblocks(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		defer close(done)
-		_, _, err := c.ReadFrom(make([]byte, 1))
+		_, _, err := c.ReadFromUDPAddrPort(make([]byte, 1))
 		done <- err
 	}()
 	time.Sleep(50 * time.Millisecond) // give ReadFrom time to get blocked
@@ -1832,8 +2100,8 @@ func TestRebindingUDPConn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer realConn.Close()
-	c.setConnLocked(realConn.(nettype.PacketConn), "udp4")
-	c.setConnLocked(newBlockForeverConn(), "")
+	c.setConnLocked(realConn.(nettype.PacketConn), "udp4", 1)
+	c.setConnLocked(newBlockForeverConn(), "", 1)
 }
 
 // https://github.com/tailscale/tailscale/issues/6680: don't ignore
@@ -1842,14 +2110,1032 @@ func TestRebindingUDPConn(t *testing.T) {
 // peers didn't change, but the netmap has non-peer info in it too we shouldn't discard)
 func TestSetNetworkMapWithNoPeers(t *testing.T) {
 	var c Conn
+	knobs := &controlknobs.Knobs{}
 	c.logf = logger.Discard
+	c.controlKnobs = knobs // TODO(bradfitz): move silent disco bool to controlknobs
 
 	for i := 1; i <= 3; i++ {
+		v := !debugEnableSilentDisco()
+		envknob.Setenv("TS_DEBUG_ENABLE_SILENT_DISCO", fmt.Sprint(v))
 		nm := &netmap.NetworkMap{}
 		c.SetNetworkMap(nm)
 		t.Logf("ptr %d: %p", i, nm)
-		if c.netMap != nm {
+		if c.lastFlags.heartbeatDisabled != v {
 			t.Fatalf("call %d: didn't store netmap", i)
 		}
+	}
+}
+
+func TestBufferedDerpWritesBeforeDrop(t *testing.T) {
+	vv := bufferedDerpWritesBeforeDrop()
+	if vv < 32 {
+		t.Fatalf("got bufferedDerpWritesBeforeDrop=%d, which is < 32", vv)
+	}
+	t.Logf("bufferedDerpWritesBeforeDrop = %d", vv)
+}
+
+// newWireguard starts up a new wireguard-go device attached to a test tun, and
+// returns the device, tun and endpoint port. To add peers call device.IpcSet with UAPI instructions.
+func newWireguard(t *testing.T, uapi string, aips []netip.Prefix) (*device.Device, *tuntest.ChannelTUN, uint16) {
+	wgtun := tuntest.NewChannelTUN()
+	wglogf := func(f string, args ...any) {
+		t.Logf("wg-go: "+f, args...)
+	}
+	wglog := device.Logger{
+		Verbosef: func(string, ...any) {},
+		Errorf:   wglogf,
+	}
+	wgdev := wgcfg.NewDevice(wgtun.TUN(), wgconn.NewDefaultBind(), &wglog)
+
+	if err := wgdev.IpcSet(uapi); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := wgdev.Up(); err != nil {
+		t.Fatal(err)
+	}
+
+	var port uint16
+	s, err := wgdev.IpcGet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		k, v, _ := strings.Cut(line, "=")
+		if k == "listen_port" {
+			p, err := strconv.ParseUint(v, 10, 16)
+			if err != nil {
+				panic(err)
+			}
+			port = uint16(p)
+			break
+		}
+	}
+
+	return wgdev, wgtun, port
+}
+
+func TestIsWireGuardOnlyPeer(t *testing.T) {
+	derpMap, cleanup := runDERPAndStun(t, t.Logf, localhostListener{}, netaddr.IPv4(127, 0, 0, 1))
+	defer cleanup()
+
+	tskey := key.NewNode()
+	tsaip := netip.MustParsePrefix("100.111.222.111/32")
+
+	wgkey := key.NewNode()
+	wgaip := netip.MustParsePrefix("100.222.111.222/32")
+
+	uapi := fmt.Sprintf("private_key=%s\npublic_key=%s\nallowed_ip=%s\n\n",
+		wgkey.UntypedHexString(), tskey.Public().UntypedHexString(), tsaip.String())
+	wgdev, wgtun, port := newWireguard(t, uapi, []netip.Prefix{wgaip})
+	defer wgdev.Close()
+	wgEp := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)
+
+	m := newMagicStackWithKey(t, t.Logf, localhostListener{}, derpMap, tskey)
+	defer m.Close()
+
+	nm := &netmap.NetworkMap{
+		Name:       "ts",
+		PrivateKey: m.privateKey,
+		NodeKey:    m.privateKey.Public(),
+		SelfNode: (&tailcfg.Node{
+			Addresses: []netip.Prefix{tsaip},
+		}).View(),
+		Peers: nodeViews([]*tailcfg.Node{
+			{
+				ID:              1,
+				Key:             wgkey.Public(),
+				Endpoints:       []netip.AddrPort{wgEp},
+				IsWireGuardOnly: true,
+				Addresses:       []netip.Prefix{wgaip},
+				AllowedIPs:      []netip.Prefix{wgaip},
+			},
+		}),
+	}
+	m.conn.SetNetworkMap(nm)
+
+	cfg, err := nmcfg.WGCfg(nm, t.Logf, netmap.AllowSubnetRoutes, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Reconfig(cfg)
+
+	pbuf := tuntest.Ping(wgaip.Addr(), tsaip.Addr())
+	m.tun.Outbound <- pbuf
+
+	select {
+	case p := <-wgtun.Inbound:
+		if !bytes.Equal(p, pbuf) {
+			t.Errorf("got unexpected packet: %x", p)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no packet after 1s")
+	}
+}
+
+func TestIsWireGuardOnlyPeerWithMasquerade(t *testing.T) {
+	derpMap, cleanup := runDERPAndStun(t, t.Logf, localhostListener{}, netaddr.IPv4(127, 0, 0, 1))
+	defer cleanup()
+
+	tskey := key.NewNode()
+	tsaip := netip.MustParsePrefix("100.111.222.111/32")
+
+	wgkey := key.NewNode()
+	wgaip := netip.MustParsePrefix("10.64.0.1/32")
+
+	// the ip that the wireguard peer has in allowed ips and expects as a masq source
+	masqip := netip.MustParsePrefix("10.64.0.2/32")
+
+	uapi := fmt.Sprintf("private_key=%s\npublic_key=%s\nallowed_ip=%s\n\n",
+		wgkey.UntypedHexString(), tskey.Public().UntypedHexString(), masqip.String())
+	wgdev, wgtun, port := newWireguard(t, uapi, []netip.Prefix{wgaip})
+	defer wgdev.Close()
+	wgEp := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)
+
+	m := newMagicStackWithKey(t, t.Logf, localhostListener{}, derpMap, tskey)
+	defer m.Close()
+
+	nm := &netmap.NetworkMap{
+		Name:       "ts",
+		PrivateKey: m.privateKey,
+		NodeKey:    m.privateKey.Public(),
+		SelfNode: (&tailcfg.Node{
+			Addresses: []netip.Prefix{tsaip},
+		}).View(),
+		Peers: nodeViews([]*tailcfg.Node{
+			{
+				ID:                            1,
+				Key:                           wgkey.Public(),
+				Endpoints:                     []netip.AddrPort{wgEp},
+				IsWireGuardOnly:               true,
+				Addresses:                     []netip.Prefix{wgaip},
+				AllowedIPs:                    []netip.Prefix{wgaip},
+				SelfNodeV4MasqAddrForThisPeer: ptr.To(masqip.Addr()),
+			},
+		}),
+	}
+	m.conn.SetNetworkMap(nm)
+
+	cfg, err := nmcfg.WGCfg(nm, t.Logf, netmap.AllowSubnetRoutes, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Reconfig(cfg)
+
+	pbuf := tuntest.Ping(wgaip.Addr(), tsaip.Addr())
+	m.tun.Outbound <- pbuf
+
+	select {
+	case p := <-wgtun.Inbound:
+
+		// TODO(raggi): move to a bytes.Equal based test later, once
+		// tuntest.Ping produces correct checksums!
+
+		var pkt packet.Parsed
+		pkt.Decode(p)
+		if pkt.ICMP4Header().Type != packet.ICMP4EchoRequest {
+			t.Fatalf("unexpected packet: %x", p)
+		}
+		if pkt.Src.Addr() != masqip.Addr() {
+			t.Fatalf("bad source IP, got %s, want %s", pkt.Src.Addr(), masqip.Addr())
+		}
+		if pkt.Dst.Addr() != wgaip.Addr() {
+			t.Fatalf("bad source IP, got %s, want %s", pkt.Src.Addr(), masqip.Addr())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no packet after 1s")
+	}
+}
+
+// applyNetworkMap is a test helper that sets the network map and
+// configures WG.
+func applyNetworkMap(t *testing.T, m *magicStack, nm *netmap.NetworkMap) {
+	t.Helper()
+	m.conn.SetNetworkMap(nm)
+	// Make sure we can't use v6 to avoid test failures.
+	m.conn.noV6.Store(true)
+
+	// Turn the network map into a wireguard config (for the tailscale internal wireguard device).
+	cfg, err := nmcfg.WGCfg(nm, t.Logf, netmap.AllowSubnetRoutes, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Apply the wireguard config to the tailscale internal wireguard device.
+	if err := m.Reconfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIsWireGuardOnlyPickEndpointByPing(t *testing.T) {
+	t.Skip("This test is flaky; see https://github.com/tailscale/tailscale/issues/8037")
+
+	clock := &tstest.Clock{}
+	derpMap, cleanup := runDERPAndStun(t, t.Logf, localhostListener{}, netaddr.IPv4(127, 0, 0, 1))
+	defer cleanup()
+
+	// Create a TS client.
+	tskey := key.NewNode()
+	tsaip := netip.MustParsePrefix("100.111.222.111/32")
+
+	// Create a WireGuard only client.
+	wgkey := key.NewNode()
+	wgaip := netip.MustParsePrefix("100.222.111.222/32")
+
+	uapi := fmt.Sprintf("private_key=%s\npublic_key=%s\nallowed_ip=%s\n\n",
+		wgkey.UntypedHexString(), tskey.Public().UntypedHexString(), tsaip.String())
+
+	wgdev, wgtun, port := newWireguard(t, uapi, []netip.Prefix{wgaip})
+	defer wgdev.Close()
+	wgEp := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)
+	wgEp2 := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.2"), port)
+
+	m := newMagicStackWithKey(t, t.Logf, localhostListener{}, derpMap, tskey)
+	defer m.Close()
+
+	pr := newPingResponder(t)
+	// Get a destination address which includes a port, so that UDP packets flow
+	// to the correct place, the mockPinger will use this to direct port-less
+	// pings to this place.
+	pingDest := pr.LocalAddr()
+
+	// Create and start the pinger that is used for the
+	// wireguard only endpoint pings
+	p, closeP := mockPinger(t, clock, pingDest)
+	defer closeP()
+	m.conn.wgPinger.Set(p)
+
+	// Create an IPv6 endpoint which should not receive any traffic.
+	v6, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.ParseIP("::"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	badEpRecv := make(chan []byte)
+	go func() {
+		defer v6.Close()
+		for {
+			b := make([]byte, 1500)
+			n, _, err := v6.ReadFrom(b)
+			if err != nil {
+				close(badEpRecv)
+				return
+			}
+			badEpRecv <- b[:n]
+		}
+	}()
+	wgEpV6 := netip.MustParseAddrPort(v6.LocalAddr().String())
+
+	nm := &netmap.NetworkMap{
+		Name:       "ts",
+		PrivateKey: m.privateKey,
+		NodeKey:    m.privateKey.Public(),
+		SelfNode: (&tailcfg.Node{
+			Addresses: []netip.Prefix{tsaip},
+		}).View(),
+		Peers: nodeViews([]*tailcfg.Node{
+			{
+				Key:             wgkey.Public(),
+				Endpoints:       []netip.AddrPort{wgEp, wgEp2, wgEpV6},
+				IsWireGuardOnly: true,
+				Addresses:       []netip.Prefix{wgaip},
+				AllowedIPs:      []netip.Prefix{wgaip},
+			},
+		}),
+	}
+
+	applyNetworkMap(t, m, nm)
+
+	buf := tuntest.Ping(wgaip.Addr(), tsaip.Addr())
+	m.tun.Outbound <- buf
+
+	select {
+	case p := <-wgtun.Inbound:
+		if !bytes.Equal(p, buf) {
+			t.Errorf("got unexpected packet: %x", p)
+		}
+	case <-badEpRecv:
+		t.Fatal("got packet on bad endpoint")
+	case <-time.After(5 * time.Second):
+		t.Fatal("no packet after 1s")
+	}
+
+	pi, ok := m.conn.peerMap.byNodeKey[wgkey.Public()]
+	if !ok {
+		t.Fatal("wgkey doesn't exist in peer map")
+	}
+
+	// Check that we got a valid address set on the first send - this
+	// will be randomly selected, but because we have noV6 set to true,
+	// it will be the IPv4 address.
+	if !pi.ep.bestAddr.Addr().IsValid() {
+		t.Fatal("bestaddr was nil")
+	}
+
+	if pi.ep.trustBestAddrUntil.Before(mono.Now().Add(14 * time.Second)) {
+		t.Errorf("trustBestAddrUntil time wasn't set to 15 seconds in the future: got %v", pi.ep.trustBestAddrUntil)
+	}
+
+	for ipp, state := range pi.ep.endpointState {
+		if ipp == wgEp {
+			if len(state.recentPongs) != 1 {
+				t.Errorf("IPv4 address did not have a recentPong entry: got %v, want %v", len(state.recentPongs), 1)
+			}
+			// Set the latency extremely low so we choose this endpoint during the next
+			// addrForSendLocked call.
+			state.recentPongs[state.recentPong].latency = time.Nanosecond
+		}
+
+		if ipp == wgEp2 {
+			if len(state.recentPongs) != 1 {
+				t.Errorf("IPv4 address did not have a recentPong entry: got %v, want %v", len(state.recentPongs), 1)
+			}
+			// Set the latency extremely high so we dont choose endpoint during the next
+			// addrForSendLocked call.
+			state.recentPongs[state.recentPong].latency = time.Second
+		}
+
+		if ipp == wgEpV6 && len(state.recentPongs) != 0 {
+			t.Fatal("IPv6 should not have recentPong: IPv6 is not useable")
+		}
+	}
+
+	// Set trustBestAddrUnitl to now, so addrForSendLocked goes through the
+	// latency selection flow.
+	pi.ep.trustBestAddrUntil = mono.Now().Add(-time.Second)
+
+	buf = tuntest.Ping(wgaip.Addr(), tsaip.Addr())
+	m.tun.Outbound <- buf
+
+	select {
+	case p := <-wgtun.Inbound:
+		if !bytes.Equal(p, buf) {
+			t.Errorf("got unexpected packet: %x", p)
+		}
+	case <-badEpRecv:
+		t.Fatal("got packet on bad endpoint")
+	case <-time.After(5 * time.Second):
+		t.Fatal("no packet after 1s")
+	}
+
+	// Check that we have responded to a WireGuard only ping twice.
+	if pr.responseCount != 2 {
+		t.Fatal("pingresponder response count was not 2", pr.responseCount)
+	}
+
+	pi, ok = m.conn.peerMap.byNodeKey[wgkey.Public()]
+	if !ok {
+		t.Fatal("wgkey doesn't exist in peer map")
+	}
+
+	if !pi.ep.bestAddr.Addr().IsValid() {
+		t.Error("no bestAddr address was set")
+	}
+
+	if pi.ep.bestAddr.Addr() != wgEp.Addr() {
+		t.Errorf("bestAddr was not set to the expected IPv4 address: got %v, want %v", pi.ep.bestAddr.Addr().String(), wgEp.Addr())
+	}
+
+	if pi.ep.trustBestAddrUntil.IsZero() {
+		t.Fatal("trustBestAddrUntil was not set")
+	}
+
+	if pi.ep.trustBestAddrUntil.Before(mono.Now().Add(55 * time.Minute)) {
+		// Set to 55 minutes incase of sloooow tests.
+		t.Errorf("trustBestAddrUntil time wasn't set to an hour in the future: got %v", pi.ep.trustBestAddrUntil)
+	}
+}
+
+// udpingPacketConn will convert potentially ICMP destination addrs to UDP
+// destination addrs in WriteTo so that a test that is intending to send ICMP
+// traffic will instead send UDP traffic, without the higher level Pinger being
+// aware of this difference.
+type udpingPacketConn struct {
+	net.PacketConn
+	// destPort will be configured by the test to be the peer expected to respond to a ping.
+	destPort uint16
+}
+
+func (u *udpingPacketConn) WriteTo(body []byte, dest net.Addr) (int, error) {
+	switch d := dest.(type) {
+	case *net.IPAddr:
+		udpAddr := &net.UDPAddr{
+			IP:   d.IP,
+			Port: int(u.destPort),
+			Zone: d.Zone,
+		}
+		return u.PacketConn.WriteTo(body, udpAddr)
+	}
+	return 0, fmt.Errorf("unimplemented udpingPacketConn for %T", dest)
+}
+
+type mockListenPacketer struct {
+	conn4 net.PacketConn
+	conn6 net.PacketConn
+}
+
+func (mlp *mockListenPacketer) ListenPacket(ctx context.Context, typ string, addr string) (net.PacketConn, error) {
+	switch typ {
+	case "ip4:icmp":
+		return mlp.conn4, nil
+	case "ip6:icmp":
+		return mlp.conn6, nil
+	}
+	return nil, fmt.Errorf("unimplemented ListenPacketForTesting for %s", typ)
+}
+
+func mockPinger(t *testing.T, clock *tstest.Clock, dest net.Addr) (*ping.Pinger, func()) {
+	ctx := context.Background()
+
+	dIPP := netip.MustParseAddrPort(dest.String())
+	// In tests, we use UDP so that we can test without being root; this
+	// doesn't matter because we mock out the ICMP reply below to be a real
+	// ICMP echo reply packet.
+	conn4, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket: %v", err)
+	}
+	conn6, err := net.ListenPacket("udp6", "[::]:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket: %v", err)
+	}
+
+	conn4 = &udpingPacketConn{
+		PacketConn: conn4,
+		destPort:   dIPP.Port(),
+	}
+
+	conn6 = &udpingPacketConn{
+		PacketConn: conn6,
+		destPort:   dIPP.Port(),
+	}
+
+	p := ping.New(ctx, t.Logf, &mockListenPacketer{conn4: conn4, conn6: conn6})
+
+	done := func() {
+		if err := p.Close(); err != nil {
+			t.Errorf("error on close: %v", err)
+		}
+	}
+
+	return p, done
+}
+
+type pingResponder struct {
+	net.PacketConn
+	running       atomic.Bool
+	responseCount int
+}
+
+func (p *pingResponder) start() {
+	buf := make([]byte, 1500)
+	for p.running.Load() {
+		n, addr, err := p.PacketConn.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+
+		m, err := icmp.ParseMessage(1, buf[:n])
+		if err != nil {
+			panic("got a non-ICMP message:" + fmt.Sprintf("%x", m))
+		}
+
+		r := icmp.Message{
+			Type: ipv4.ICMPTypeEchoReply,
+			Code: m.Code,
+			Body: m.Body,
+		}
+
+		b, err := r.Marshal(nil)
+		if err != nil {
+			panic(err)
+		}
+
+		if _, err := p.PacketConn.WriteTo(b, addr); err != nil {
+			panic(err)
+		}
+		p.responseCount++
+	}
+}
+
+func (p *pingResponder) stop() {
+	p.running.Store(false)
+	p.Close()
+}
+
+func newPingResponder(t *testing.T) *pingResponder {
+	t.Helper()
+	// global binds should be both IPv4 and IPv6 (if our test platforms don't,
+	// we might need to bind two sockets instead)
+	conn, err := net.ListenPacket("udp", ":")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr := &pingResponder{PacketConn: conn}
+	pr.running.Store(true)
+	go pr.start()
+	t.Cleanup(pr.stop)
+	return pr
+}
+
+func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
+	testTime := mono.Now()
+	secondPingTime := testTime.Add(10 * time.Second)
+
+	type endpointDetails struct {
+		addrPort netip.AddrPort
+		latency  time.Duration
+	}
+
+	wgTests := []struct {
+		name             string
+		sendInitialPing  bool
+		validAddr        bool
+		sendFollowUpPing bool
+		pingTime         mono.Time
+		ep               []endpointDetails
+		want             netip.AddrPort
+	}{
+		{
+			name:             "no endpoints",
+			sendInitialPing:  false,
+			validAddr:        false,
+			sendFollowUpPing: false,
+			pingTime:         testTime,
+			ep:               []endpointDetails{},
+			want:             netip.AddrPort{},
+		},
+		{
+			name:             "singular endpoint does not request ping",
+			sendInitialPing:  false,
+			validAddr:        true,
+			sendFollowUpPing: false,
+			pingTime:         testTime,
+			ep: []endpointDetails{
+				{
+					addrPort: netip.MustParseAddrPort("1.1.1.1:111"),
+					latency:  100 * time.Millisecond,
+				},
+			},
+			want: netip.MustParseAddrPort("1.1.1.1:111"),
+		},
+		{
+			name:             "ping sent within wireguardPingInterval should not request ping",
+			sendInitialPing:  true,
+			validAddr:        true,
+			sendFollowUpPing: false,
+			pingTime:         testTime.Add(7 * time.Second),
+			ep: []endpointDetails{
+				{
+					addrPort: netip.MustParseAddrPort("1.1.1.1:111"),
+					latency:  100 * time.Millisecond,
+				},
+				{
+					addrPort: netip.MustParseAddrPort("[2345:0425:2CA1:0000:0000:0567:5673:23b5]:222"),
+					latency:  2000 * time.Millisecond,
+				},
+			},
+			want: netip.MustParseAddrPort("1.1.1.1:111"),
+		},
+		{
+			name:             "ping sent outside of wireguardPingInterval should request ping",
+			sendInitialPing:  true,
+			validAddr:        true,
+			sendFollowUpPing: true,
+			pingTime:         testTime.Add(3 * time.Second),
+			ep: []endpointDetails{
+				{
+					addrPort: netip.MustParseAddrPort("1.1.1.1:111"),
+					latency:  100 * time.Millisecond,
+				},
+				{
+					addrPort: netip.MustParseAddrPort("[2345:0425:2CA1:0000:0000:0567:5673:23b5]:222"),
+					latency:  150 * time.Millisecond,
+				},
+			},
+			want: netip.MustParseAddrPort("1.1.1.1:111"),
+		},
+		{
+			name:             "choose lowest latency for useable IPv4 and IPv6",
+			sendInitialPing:  true,
+			validAddr:        true,
+			sendFollowUpPing: false,
+			pingTime:         secondPingTime,
+			ep: []endpointDetails{
+				{
+					addrPort: netip.MustParseAddrPort("1.1.1.1:111"),
+					latency:  100 * time.Millisecond,
+				},
+				{
+					addrPort: netip.MustParseAddrPort("[2345:0425:2CA1:0000:0000:0567:5673:23b5]:222"),
+					latency:  10 * time.Millisecond,
+				},
+			},
+			want: netip.MustParseAddrPort("[2345:0425:2CA1:0000:0000:0567:5673:23b5]:222"),
+		},
+		{
+			name:             "choose IPv6 address when latency is the same for v4 and v6",
+			sendInitialPing:  true,
+			validAddr:        true,
+			sendFollowUpPing: false,
+			pingTime:         secondPingTime,
+			ep: []endpointDetails{
+				{
+					addrPort: netip.MustParseAddrPort("1.1.1.1:111"),
+					latency:  100 * time.Millisecond,
+				},
+				{
+					addrPort: netip.MustParseAddrPort("[1::1]:567"),
+					latency:  100 * time.Millisecond,
+				},
+			},
+			want: netip.MustParseAddrPort("[1::1]:567"),
+		},
+	}
+
+	for _, test := range wgTests {
+		t.Run(test.name, func(t *testing.T) {
+			endpoint := &endpoint{
+				isWireguardOnly: true,
+				endpointState:   map[netip.AddrPort]*endpointState{},
+				c: &Conn{
+					logf: t.Logf,
+					noV4: atomic.Bool{},
+					noV6: atomic.Bool{},
+				},
+			}
+
+			for _, epd := range test.ep {
+				endpoint.endpointState[epd.addrPort] = &endpointState{}
+			}
+			udpAddr, _, shouldPing := endpoint.addrForSendLocked(testTime)
+			if udpAddr.IsValid() != test.validAddr {
+				t.Errorf("udpAddr validity is incorrect; got %v, want %v", udpAddr.IsValid(), test.validAddr)
+			}
+			if shouldPing != test.sendInitialPing {
+				t.Errorf("addrForSendLocked did not indiciate correct ping state; got %v, want %v", shouldPing, test.sendInitialPing)
+			}
+
+			// Update the endpointState to simulate a ping having been
+			// sent and a pong received.
+			for _, epd := range test.ep {
+				state, ok := endpoint.endpointState[epd.addrPort]
+				if !ok {
+					t.Errorf("addr does not exist in endpoint state map")
+				}
+				state.lastPing = test.pingTime
+
+				latency, ok := state.latencyLocked()
+				if ok {
+					t.Errorf("latency was set for %v: %v", epd.addrPort, latency)
+				}
+				state.recentPongs = append(state.recentPongs, pongReply{
+					latency: epd.latency,
+				})
+				state.recentPong = 0
+			}
+
+			udpAddr, _, shouldPing = endpoint.addrForSendLocked(secondPingTime)
+			if udpAddr != test.want {
+				t.Errorf("udpAddr returned is not expected: got %v, want %v", udpAddr, test.want)
+			}
+			if shouldPing != test.sendFollowUpPing {
+				t.Errorf("addrForSendLocked did not indiciate correct ping state; got %v, want %v", shouldPing, test.sendFollowUpPing)
+			}
+			if endpoint.bestAddr.AddrPort != test.want {
+				t.Errorf("bestAddr.AddrPort is not as expected: got %v, want %v", endpoint.bestAddr.AddrPort, test.want)
+			}
+		})
+	}
+}
+
+func TestAddrForPingSizeLocked(t *testing.T) {
+	testTime := mono.Now()
+
+	validUdpAddr := netip.MustParseAddrPort("1.1.1.1:111")
+	validDerpAddr := netip.MustParseAddrPort("2.2.2.2:222")
+
+	pingTests := []struct {
+		desc            string
+		size            int           // size of ping payload
+		mtu             tstun.WireMTU // The MTU of the path to bestAddr, if any
+		bestAddr        bool          // If the endpoint should have a valid bestAddr
+		bestAddrTrusted bool          // If the bestAddr has not yet expired
+		wantUDP         bool          // Non-zero UDP addr means send to UDP; zero means start discovery
+		wantDERP        bool          // Non-zero DERP addr means send to DERP
+	}{
+		{
+			desc:            "ping_size_0_and_invalid_UDP_addr_should_start_discovery_and_send_to_DERP",
+			size:            0,
+			bestAddr:        false,
+			bestAddrTrusted: false,
+			wantUDP:         false,
+			wantDERP:        true,
+		},
+		{
+			desc:            "ping_size_0_and_valid_trusted_UDP_addr_should_send_to_UDP_and_not_send_to_DERP",
+			size:            0,
+			bestAddr:        true,
+			bestAddrTrusted: true,
+			wantUDP:         true,
+			wantDERP:        false,
+		},
+		{
+			desc:            "ping_size_0_and_valid_but_expired_UDP_addr_should_send_to_both_UDP_and_DERP",
+			size:            0,
+			bestAddr:        true,
+			bestAddrTrusted: false,
+			wantUDP:         true,
+			wantDERP:        true,
+		},
+		{
+			desc:            "ping_size_too_big_for_trusted_UDP_addr_should_start_discovery_and_send_to_DERP",
+			size:            pktLenToPingSize(1501, validUdpAddr.Addr().Is6()),
+			mtu:             1500,
+			bestAddr:        true,
+			bestAddrTrusted: true,
+			wantUDP:         false,
+			wantDERP:        true,
+		},
+		{
+			desc:            "ping_size_too_big_for_untrusted_UDP_addr_should_start_discovery_and_send_to_DERP",
+			size:            pktLenToPingSize(1501, validUdpAddr.Addr().Is6()),
+			mtu:             1500,
+			bestAddr:        true,
+			bestAddrTrusted: false,
+			wantUDP:         false,
+			wantDERP:        true,
+		},
+		{
+			desc:            "ping_size_small_enough_for_trusted_UDP_addr_should_send_to_UDP_and_not_DERP",
+			size:            pktLenToPingSize(1500, validUdpAddr.Addr().Is6()),
+			mtu:             1500,
+			bestAddr:        true,
+			bestAddrTrusted: true,
+			wantUDP:         true,
+			wantDERP:        false,
+		},
+		{
+			desc:            "ping_size_small_enough_for_untrusted_UDP_addr_should_send_to_UDP_and_DERP",
+			size:            pktLenToPingSize(1500, validUdpAddr.Addr().Is6()),
+			mtu:             1500,
+			bestAddr:        true,
+			bestAddrTrusted: false,
+			wantUDP:         true,
+			wantDERP:        true,
+		},
+	}
+
+	for _, test := range pingTests {
+		t.Run(test.desc, func(t *testing.T) {
+			bestAddr := addrQuality{wireMTU: test.mtu}
+			if test.bestAddr {
+				bestAddr.AddrPort = validUdpAddr
+			}
+			ep := &endpoint{
+				derpAddr: validDerpAddr,
+				bestAddr: bestAddr,
+			}
+			if test.bestAddrTrusted {
+				ep.trustBestAddrUntil = testTime.Add(1 * time.Second)
+			}
+
+			udpAddr, derpAddr := ep.addrForPingSizeLocked(testTime, test.size)
+
+			if test.wantUDP && !udpAddr.IsValid() {
+				t.Errorf("%s: udpAddr returned is not valid, won't be sent to UDP address", test.desc)
+			}
+			if !test.wantUDP && udpAddr.IsValid() {
+				t.Errorf("%s: udpAddr returned is valid, discovery will not start", test.desc)
+			}
+			if test.wantDERP && !derpAddr.IsValid() {
+				t.Errorf("%s: derpAddr returned is not valid, won't be sent to DERP", test.desc)
+			}
+			if !test.wantDERP && derpAddr.IsValid() {
+				t.Errorf("%s: derpAddr returned is valid, will be sent to DERP", test.desc)
+			}
+		})
+	}
+}
+
+func TestMaybeSetNearestDERP(t *testing.T) {
+	derpMap := &tailcfg.DERPMap{
+		Regions: map[int]*tailcfg.DERPRegion{
+			1: {
+				RegionID:   1,
+				RegionCode: "test",
+				Nodes: []*tailcfg.DERPNode{
+					{
+						Name:     "t1",
+						RegionID: 1,
+						HostName: "test-node.unused",
+						IPv4:     "127.0.0.1",
+						IPv6:     "none",
+					},
+				},
+			},
+			21: {
+				RegionID:   21,
+				RegionCode: "tor",
+				Nodes: []*tailcfg.DERPNode{
+					{
+						Name:     "21b",
+						RegionID: 21,
+						HostName: "tor.test-node.unused",
+						IPv4:     "127.0.0.1",
+						IPv6:     "none",
+					},
+				},
+			},
+			31: {
+				RegionID:   31,
+				RegionCode: "fallback",
+				Nodes: []*tailcfg.DERPNode{
+					{
+						Name:     "31b",
+						RegionID: 31,
+						HostName: "fallback.test-node.unused",
+						IPv4:     "127.0.0.1",
+						IPv6:     "none",
+					},
+				},
+			},
+		},
+	}
+
+	// Ensure that our fallback code always picks a deterministic value.
+	tstest.Replace(t, &pickDERPFallbackForTests, func() int { return 31 })
+
+	// Actually test this code path.
+	tstest.Replace(t, &checkControlHealthDuringNearestDERPInTests, true)
+
+	testCases := []struct {
+		name               string
+		old                int
+		reportDERP         int
+		connectedToControl bool
+		want               int
+	}{
+		{
+			name:               "connected_with_report_derp",
+			old:                1,
+			reportDERP:         21,
+			connectedToControl: true,
+			want:               21,
+		},
+		{
+			name:               "not_connected_with_report_derp",
+			old:                1,
+			reportDERP:         21,
+			connectedToControl: false,
+			want:               1, // no change
+		},
+		{
+			name:               "not_connected_with_report_derp_and_no_current",
+			old:                0,     // no current DERP
+			reportDERP:         21,    // have new DERP
+			connectedToControl: false, // not connected...
+			want:               21,    // ... but want to change to new DERP
+		},
+		{
+			name:               "not_connected_with_fallback_and_no_current",
+			old:                0,     // no current DERP
+			reportDERP:         0,     // no new DERP
+			connectedToControl: false, // not connected...
+			want:               31,    // ... but we fallback to deterministic value
+		},
+		{
+			name:               "connected_no_derp",
+			old:                1,
+			reportDERP:         0,
+			connectedToControl: true,
+			want:               1, // no change
+		},
+		{
+			name:               "connected_no_derp_fallback",
+			old:                0,
+			reportDERP:         0,
+			connectedToControl: true,
+			want:               31, // deterministic fallback
+		},
+	}
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			ht := new(health.Tracker)
+			c := newConn(t.Logf)
+			c.myDerp = tt.old
+			c.derpMap = derpMap
+			c.health = ht
+
+			report := &netcheck.Report{PreferredDERP: tt.reportDERP}
+
+			oldConnected := ht.GetInPollNetMap()
+			if tt.connectedToControl != oldConnected {
+				if tt.connectedToControl {
+					ht.GotStreamedMapResponse()
+					t.Cleanup(ht.SetOutOfPollNetMap)
+				} else {
+					ht.SetOutOfPollNetMap()
+					t.Cleanup(ht.GotStreamedMapResponse)
+				}
+			}
+
+			got := c.maybeSetNearestDERP(report)
+			if got != tt.want {
+				t.Errorf("got new DERP region %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldRebind(t *testing.T) {
+	tests := []struct {
+		err    error
+		ok     bool
+		reason string
+	}{
+		{nil, false, ""},
+		{io.EOF, false, ""},
+		{io.ErrUnexpectedEOF, false, ""},
+		{io.ErrShortBuffer, false, ""},
+		{&net.OpError{Err: syscall.EPERM}, true, "operation-not-permitted"},
+		{&net.OpError{Err: syscall.EPIPE}, true, "broken-pipe"},
+		{&net.OpError{Err: syscall.ENOTCONN}, true, "broken-pipe"},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%s-%v", tt.err, tt.ok), func(t *testing.T) {
+			if got, reason := shouldRebind(tt.err); got != tt.ok || reason != tt.reason {
+				t.Errorf("errShouldRebind(%v) = %v, %q; want %v, %q", tt.err, got, reason, tt.ok, tt.reason)
+			}
+		})
+	}
+}
+
+func TestMaybeRebindOnError(t *testing.T) {
+	tstest.PanicOnLog()
+	tstest.ResourceCheck(t)
+
+	var rebindErrs []error
+	if runtime.GOOS != "plan9" {
+		rebindErrs = append(rebindErrs,
+			&net.OpError{Err: syscall.EPERM},
+			&net.OpError{Err: syscall.EPIPE},
+			&net.OpError{Err: syscall.ENOTCONN},
+		)
+	}
+
+	for _, rebindErr := range rebindErrs {
+		t.Run(fmt.Sprintf("rebind-%s", rebindErr), func(t *testing.T) {
+			conn := newTestConn(t)
+			defer conn.Close()
+
+			before := metricRebindCalls.Value()
+			conn.maybeRebindOnError(rebindErr)
+			after := metricRebindCalls.Value()
+			if before+1 != after {
+				t.Errorf("should rebind on %#v", rebindErr)
+			}
+		})
+	}
+
+	t.Run("no-frequent-rebind", func(t *testing.T) {
+		if runtime.GOOS != "plan9" {
+			err := fmt.Errorf("outer err: %w", syscall.EPERM)
+			conn := newTestConn(t)
+			defer conn.Close()
+			conn.lastErrRebind.Store(time.Now().Add(-1 * time.Second))
+			before := metricRebindCalls.Value()
+			conn.maybeRebindOnError(err)
+			after := metricRebindCalls.Value()
+			if before != after {
+				t.Errorf("should not rebind within 5 seconds of last")
+			}
+		}
+	})
+}
+
+func TestNetworkDownSendErrors(t *testing.T) {
+	netMon := must.Get(netmon.New(t.Logf))
+	defer netMon.Close()
+
+	reg := new(usermetric.Registry)
+	conn := must.Get(NewConn(Options{
+		DisablePortMapper: true,
+		Logf:              t.Logf,
+		NetMon:            netMon,
+		Metrics:           reg,
+	}))
+	defer conn.Close()
+
+	conn.SetNetworkUp(false)
+	if err := conn.Send([][]byte{{00}}, &lazyEndpoint{}); err == nil {
+		t.Error("expected error, got nil")
+	}
+	resp := httptest.NewRecorder()
+	reg.Handler(resp, new(http.Request))
+	if !strings.Contains(resp.Body.String(), `tailscaled_outbound_dropped_packets_total{reason="error"} 1`) {
+		t.Errorf("expected NetworkDown to increment packet dropped metric; got %q", resp.Body.String())
 	}
 }

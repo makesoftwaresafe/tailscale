@@ -11,9 +11,9 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math/bits"
+	"slices"
 	"unicode/utf8"
-
-	"golang.org/x/exp/slices"
 )
 
 // PrivateID represents a log steam for writing.
@@ -39,8 +39,18 @@ func ParsePrivateID(in string) (out PrivateID, err error) {
 	return out, err
 }
 
+// Add adds i to the id, treating it as an unsigned 256-bit big-endian integer,
+// and returns the resulting ID.
+func (id PrivateID) Add(i int64) PrivateID {
+	return add(id, i)
+}
+
+func (id PrivateID) AppendText(b []byte) ([]byte, error) {
+	return hex.AppendEncode(b, id[:]), nil
+}
+
 func (id PrivateID) MarshalText() ([]byte, error) {
-	return formatID(id), nil
+	return id.AppendText(nil)
 }
 
 func (id *PrivateID) UnmarshalText(in []byte) error {
@@ -48,7 +58,15 @@ func (id *PrivateID) UnmarshalText(in []byte) error {
 }
 
 func (id PrivateID) String() string {
-	return string(formatID(id))
+	return string(hex.AppendEncode(nil, id[:]))
+}
+
+func (id1 PrivateID) Less(id2 PrivateID) bool {
+	return id1.Compare(id2) < 0
+}
+
+func (id1 PrivateID) Compare(id2 PrivateID) int {
+	return slices.Compare(id1[:], id2[:])
 }
 
 func (id PrivateID) IsZero() bool {
@@ -71,8 +89,18 @@ func ParsePublicID(in string) (out PublicID, err error) {
 	return out, err
 }
 
+// Add adds i to the id, treating it as an unsigned 256-bit big-endian integer,
+// and returns the resulting ID.
+func (id PublicID) Add(i int64) PublicID {
+	return add(id, i)
+}
+
+func (id PublicID) AppendText(b []byte) ([]byte, error) {
+	return hex.AppendEncode(b, id[:]), nil
+}
+
 func (id PublicID) MarshalText() ([]byte, error) {
-	return formatID(id), nil
+	return id.AppendText(nil)
 }
 
 func (id *PublicID) UnmarshalText(in []byte) error {
@@ -80,11 +108,15 @@ func (id *PublicID) UnmarshalText(in []byte) error {
 }
 
 func (id PublicID) String() string {
-	return string(formatID(id))
+	return string(hex.AppendEncode(nil, id[:]))
 }
 
 func (id1 PublicID) Less(id2 PublicID) bool {
-	return slices.Compare(id1[:], id2[:]) < 0
+	return id1.Compare(id2) < 0
+}
+
+func (id1 PublicID) Compare(id2 PublicID) int {
+	return slices.Compare(id1[:], id2[:])
 }
 
 func (id PublicID) IsZero() bool {
@@ -93,12 +125,6 @@ func (id PublicID) IsZero() bool {
 
 func (id PublicID) Prefix64() uint64 {
 	return binary.BigEndian.Uint64(id[:8])
-}
-
-func formatID(in [32]byte) []byte {
-	var hexArr [2 * len(in)]byte
-	hex.Encode(hexArr[:], in[:])
-	return hexArr[:]
 }
 
 func parseID[Bytes []byte | string](funcName string, out *[32]byte, in Bytes) (err error) {
@@ -112,4 +138,23 @@ func parseID[Bytes []byte | string](funcName string, out *[32]byte, in Bytes) (e
 		return fmt.Errorf("%s: invalid hex character: %c", funcName, r)
 	}
 	return nil
+}
+
+func add(id [32]byte, i int64) [32]byte {
+	var out uint64
+	switch {
+	case i < 0:
+		borrow := ^uint64(i) + 1 // twos-complement inversion
+		for i := 0; i < 4 && borrow > 0; i++ {
+			out, borrow = bits.Sub64(binary.BigEndian.Uint64(id[8*(3-i):]), borrow, 0)
+			binary.BigEndian.PutUint64(id[8*(3-i):], out)
+		}
+	case i > 0:
+		carry := uint64(i)
+		for i := 0; i < 4 && carry > 0; i++ {
+			out, carry = bits.Add64(binary.BigEndian.Uint64(id[8*(3-i):]), carry, 0)
+			binary.BigEndian.PutUint64(id[8*(3-i):], out)
+		}
+	}
+	return id
 }

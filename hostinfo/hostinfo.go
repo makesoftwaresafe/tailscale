@@ -7,8 +7,10 @@ package hostinfo
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 	"os"
+	"os/exec"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -23,8 +25,9 @@ import (
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/util/lineread"
+	"tailscale.com/util/lineiter"
 	"tailscale.com/version"
+	"tailscale.com/version/distro"
 )
 
 var started = time.Now()
@@ -50,11 +53,11 @@ func New() *tailcfg.Hostinfo {
 		GoArchVar:       lazyGoArchVar.Get(),
 		GoVersion:       runtime.Version(),
 		Machine:         condCall(unameMachine),
-		DeviceModel:     deviceModel(),
-		PushDeviceToken: pushDeviceToken(),
+		DeviceModel:     deviceModelCached(),
 		Cloud:           string(cloudenv.Get()),
 		NoLogsNoSupport: envknob.NoLogsNoSupport(),
 		AllowsUpdate:    envknob.AllowsRemoteUpdate(),
+		WoLMACs:         getWoLMACs(),
 	}
 }
 
@@ -66,6 +69,7 @@ var (
 	distroVersion  func() string
 	distroCodeName func() string
 	unameMachine   func() string
+	deviceModel    func() string
 )
 
 func condCall[T any](fn func() T) T {
@@ -139,15 +143,16 @@ func packageTypeCached() string {
 type EnvType string
 
 const (
-	KNative         = EnvType("kn")
-	AWSLambda       = EnvType("lm")
-	Heroku          = EnvType("hr")
-	AzureAppService = EnvType("az")
-	AWSFargate      = EnvType("fg")
-	FlyDotIo        = EnvType("fly")
-	Kubernetes      = EnvType("k8s")
-	DockerDesktop   = EnvType("dde")
-	Replit          = EnvType("repl")
+	KNative            = EnvType("kn")
+	AWSLambda          = EnvType("lm")
+	Heroku             = EnvType("hr")
+	AzureAppService    = EnvType("az")
+	AWSFargate         = EnvType("fg")
+	FlyDotIo           = EnvType("fly")
+	Kubernetes         = EnvType("k8s")
+	DockerDesktop      = EnvType("dde")
+	Replit             = EnvType("repl")
+	HomeAssistantAddOn = EnvType("haao")
 )
 
 var envType atomic.Value // of EnvType
@@ -162,27 +167,46 @@ func GetEnvType() EnvType {
 }
 
 var (
-	pushDeviceTokenAtomic atomic.Value // of string
-	deviceModelAtomic     atomic.Value // of string
-	osVersionAtomic       atomic.Value // of string
-	desktopAtomic         atomic.Value // of opt.Bool
-	packagingType         atomic.Value // of string
-	appType               atomic.Value // of string
+	deviceModelAtomic atomic.Value // of string
+	osVersionAtomic   atomic.Value // of string
+	desktopAtomic     atomic.Value // of opt.Bool
+	packagingType     atomic.Value // of string
+	appType           atomic.Value // of string
+	firewallMode      atomic.Value // of string
 )
-
-// SetPushDeviceToken sets the device token for use in Hostinfo updates.
-func SetPushDeviceToken(token string) { pushDeviceTokenAtomic.Store(token) }
 
 // SetDeviceModel sets the device model for use in Hostinfo updates.
 func SetDeviceModel(model string) { deviceModelAtomic.Store(model) }
 
+func deviceModelCached() string {
+	if v, _ := deviceModelAtomic.Load().(string); v != "" {
+		return v
+	}
+	if deviceModel == nil {
+		return ""
+	}
+	v := deviceModel()
+	if v != "" {
+		deviceModelAtomic.Store(v)
+	}
+	return v
+}
+
 // SetOSVersion sets the OS version.
 func SetOSVersion(v string) { osVersionAtomic.Store(v) }
 
+// SetFirewallMode sets the firewall mode for the app.
+func SetFirewallMode(v string) { firewallMode.Store(v) }
+
 // SetPackage sets the packaging type for the app.
 //
-// As of 2022-03-25, this is used by Android ("nogoogle" for the
-// F-Droid build) and tsnet (set to "tsnet").
+// For Android, the possible values are:
+// - "googleplay": installed from Google Play Store.
+// - "fdroid": installed from the F-Droid repository.
+// - "amazon": installed from the Amazon Appstore.
+// - "unknown": when the installer package name is null.
+// - "unknown$installerPackageName": for unrecognized installer package names, prefixed by "unknown".
+// Additionally, tsnet sets this value to "tsnet".
 func SetPackage(v string) { packagingType.Store(v) }
 
 // SetApp sets the app type for the app.
@@ -190,13 +214,10 @@ func SetPackage(v string) { packagingType.Store(v) }
 // and "k8s-operator".
 func SetApp(v string) { appType.Store(v) }
 
-func deviceModel() string {
-	s, _ := deviceModelAtomic.Load().(string)
-	return s
-}
-
-func pushDeviceToken() string {
-	s, _ := pushDeviceTokenAtomic.Load().(string)
+// FirewallMode returns the firewall mode for the app.
+// It is empty if unset.
+func FirewallMode() string {
+	s, _ := firewallMode.Load().(string)
 	return s
 }
 
@@ -210,12 +231,11 @@ func desktop() (ret opt.Bool) {
 	}
 
 	seenDesktop := false
-	lineread.File("/proc/net/unix", func(line []byte) error {
-		seenDesktop = seenDesktop || mem.Contains(mem.B(line), mem.S(" @/tmp/dbus-"))
+	for lr := range lineiter.File("/proc/net/unix") {
+		line, _ := lr.Value()
 		seenDesktop = seenDesktop || mem.Contains(mem.B(line), mem.S(".X11-unix"))
 		seenDesktop = seenDesktop || mem.Contains(mem.B(line), mem.S("/wayland-1"))
-		return nil
-	})
+	}
 	ret.Set(seenDesktop)
 
 	// Only cache after a minute - compositors might not have started yet.
@@ -253,16 +273,28 @@ func getEnvType() EnvType {
 	if inReplit() {
 		return Replit
 	}
+	if inHomeAssistantAddOn() {
+		return HomeAssistantAddOn
+	}
 	return ""
 }
 
-// inContainer reports whether we're running in a container.
+// inContainer reports whether we're running in a container. Best-effort only,
+// there's no foolproof way to detect this, but the build tag should catch all
+// official builds from 1.78.0.
 func inContainer() opt.Bool {
 	if runtime.GOOS != "linux" {
 		return ""
 	}
 	var ret opt.Bool
 	ret.Set(false)
+	if packageType != nil && packageType() == "container" {
+		// Go build tag ts_package_container was set during build.
+		ret.Set(true)
+		return ret
+	}
+	// Only set if using docker's container runtime. Not guaranteed by
+	// documentation, but it's been in place for a long time.
 	if _, err := os.Stat("/.dockerenv"); err == nil {
 		ret.Set(true)
 		return ret
@@ -272,21 +304,21 @@ func inContainer() opt.Bool {
 		ret.Set(true)
 		return ret
 	}
-	lineread.File("/proc/1/cgroup", func(line []byte) error {
+	for lr := range lineiter.File("/proc/1/cgroup") {
+		line, _ := lr.Value()
 		if mem.Contains(mem.B(line), mem.S("/docker/")) ||
 			mem.Contains(mem.B(line), mem.S("/lxc/")) {
 			ret.Set(true)
-			return io.EOF // arbitrary non-nil error to stop loop
+			break
 		}
-		return nil
-	})
-	lineread.File("/proc/mounts", func(line []byte) error {
-		if mem.Contains(mem.B(line), mem.S("fuse.lxcfs")) {
+	}
+	for lr := range lineiter.File("/proc/mounts") {
+		line, _ := lr.Value()
+		if mem.Contains(mem.B(line), mem.S("lxcfs /proc/cpuinfo fuse.lxcfs")) {
 			ret.Set(true)
-			return io.EOF
+			break
 		}
-		return nil
-	})
+	}
 	return ret
 }
 
@@ -327,10 +359,7 @@ func inAzureAppService() bool {
 }
 
 func inAWSFargate() bool {
-	if os.Getenv("AWS_EXECUTION_ENV") == "AWS_ECS_FARGATE" {
-		return true
-	}
-	return false
+	return os.Getenv("AWS_EXECUTION_ENV") == "AWS_ECS_FARGATE"
 }
 
 func inFlyDotIo() bool {
@@ -341,7 +370,7 @@ func inFlyDotIo() bool {
 }
 
 func inReplit() bool {
-	// https://docs.replit.com/programming-ide/getting-repl-metadata
+	// https://docs.replit.com/replit-workspace/configuring-repl#environment-variables
 	if os.Getenv("REPL_OWNER") != "" && os.Getenv("REPL_SLUG") != "" {
 		return true
 	}
@@ -356,7 +385,11 @@ func inKubernetes() bool {
 }
 
 func inDockerDesktop() bool {
-	if os.Getenv("TS_HOST_ENV") == "dde" {
+	return os.Getenv("TS_HOST_ENV") == "dde"
+}
+
+func inHomeAssistantAddOn() bool {
+	if os.Getenv("SUPERVISOR_TOKEN") != "" || os.Getenv("HASSIO_TOKEN") != "" {
 		return true
 	}
 	return false
@@ -405,7 +438,7 @@ func DisabledEtcAptSource() bool {
 		return false
 	}
 	mod := fi.ModTime()
-	if c, ok := etcAptSrcCache.Load().(etcAptSrcResult); ok && c.mod == mod {
+	if c, ok := etcAptSrcCache.Load().(etcAptSrcResult); ok && c.mod.Equal(mod) {
 		return c.disabled
 	}
 	f, err := os.Open(path)
@@ -434,3 +467,24 @@ func etcAptSourceFileIsDisabled(r io.Reader) bool {
 	}
 	return disabled
 }
+
+// IsSELinuxEnforcing reports whether SELinux is in "Enforcing" mode.
+func IsSELinuxEnforcing() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	out, _ := exec.Command("getenforce").Output()
+	return string(bytes.TrimSpace(out)) == "Enforcing"
+}
+
+// IsNATLabGuestVM reports whether the current host is a NAT Lab guest VM.
+func IsNATLabGuestVM() bool {
+	if runtime.GOOS == "linux" && distro.Get() == distro.Gokrazy {
+		cmdLine, _ := os.ReadFile("/proc/cmdline")
+		return bytes.Contains(cmdLine, []byte("tailscale-tta=1"))
+	}
+	return false
+}
+
+// NAT Lab VMs have a unique MAC address prefix.
+// See

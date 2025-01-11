@@ -14,21 +14,23 @@ import (
 
 	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/netipx"
+	"tailscale.com/health"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/logger"
 	"tailscale.com/version"
-	"tailscale.com/wgengine/monitor"
 )
 
 type userspaceBSDRouter struct {
 	logf    logger.Logf
-	linkMon *monitor.Mon
+	netMon  *netmon.Monitor
+	health  *health.Tracker
 	tunname string
 	local   []netip.Prefix
 	routes  map[netip.Prefix]bool
 }
 
-func newUserspaceBSDRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor.Mon) (Router, error) {
+func newUserspaceBSDRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor, health *health.Tracker) (Router, error) {
 	tunname, err := tundev.Name()
 	if err != nil {
 		return nil, err
@@ -36,7 +38,8 @@ func newUserspaceBSDRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor
 
 	return &userspaceBSDRouter{
 		logf:    logf,
-		linkMon: linkMon,
+		netMon:  netMon,
+		health:  health,
 		tunname: tunname,
 	}, nil
 }
@@ -194,6 +197,13 @@ func (r *userspaceBSDRouter) Set(cfg *Config) (reterr error) {
 	r.routes = newRoutes
 
 	return reterr
+}
+
+// UpdateMagicsockPort implements the Router interface. This implementation
+// does nothing and returns nil because this router does not currently need
+// to know what the magicsock UDP port is.
+func (r *userspaceBSDRouter) UpdateMagicsockPort(_ uint16, _ string) error {
+	return nil
 }
 
 func (r *userspaceBSDRouter) Close() error {

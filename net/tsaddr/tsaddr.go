@@ -8,10 +8,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"net/netip"
+	"slices"
 	"sync"
 
-	"golang.org/x/exp/slices"
+	"go4.org/netipx"
 	"tailscale.com/net/netaddr"
+	"tailscale.com/types/views"
 )
 
 // ChromeOSVMRange returns the subset of the CGNAT IPv4 range used by
@@ -35,7 +37,6 @@ func CGNATRange() netip.Prefix {
 
 var (
 	cgnatRange   oncePrefix
-	ulaRange     oncePrefix
 	tsUlaRange   oncePrefix
 	tsViaRange   oncePrefix
 	ula4To6Range oncePrefix
@@ -65,13 +66,19 @@ const (
 	TailscaleServiceIPv6String = "fd7a:115c:a1e0::53"
 )
 
-// IsTailscaleIP reports whether ip is an IP address in a range that
+// IsTailscaleIP reports whether IP is an IP address in a range that
 // Tailscale assigns from.
 func IsTailscaleIP(ip netip.Addr) bool {
 	if ip.Is4() {
-		return CGNATRange().Contains(ip) && !ChromeOSVMRange().Contains(ip)
+		return IsTailscaleIPv4(ip)
 	}
 	return TailscaleULARange().Contains(ip)
+}
+
+// IsTailscaleIPv4 reports whether an IPv4 IP is an IP address that
+// Tailscale assigns from.
+func IsTailscaleIPv4(ip netip.Addr) bool {
+	return CGNATRange().Contains(ip) && !ChromeOSVMRange().Contains(ip)
 }
 
 // TailscaleULARange returns the IPv6 Unique Local Address range that
@@ -159,53 +166,6 @@ type oncePrefix struct {
 	v netip.Prefix
 }
 
-// NewContainsIPFunc returns a func that reports whether ip is in addrs.
-//
-// It's optimized for the cases of addrs being empty and addrs
-// containing 1 or 2 single-IP prefixes (such as one IPv4 address and
-// one IPv6 address).
-//
-// Otherwise the implementation is somewhat slow.
-func NewContainsIPFunc(addrs []netip.Prefix) func(ip netip.Addr) bool {
-	// Specialize the three common cases: no address, just IPv4
-	// (or just IPv6), and both IPv4 and IPv6.
-	if len(addrs) == 0 {
-		return func(netip.Addr) bool { return false }
-	}
-	// If any addr is more than a single IP, then just do the slow
-	// linear thing until
-	// https://github.com/inetaf/netaddr/issues/139 is done.
-	for _, a := range addrs {
-		if a.IsSingleIP() {
-			continue
-		}
-		acopy := append([]netip.Prefix(nil), addrs...)
-		return func(ip netip.Addr) bool {
-			for _, a := range acopy {
-				if a.Contains(ip) {
-					return true
-				}
-			}
-			return false
-		}
-	}
-	// Fast paths for 1 and 2 IPs:
-	if len(addrs) == 1 {
-		a := addrs[0]
-		return func(ip netip.Addr) bool { return ip == a.Addr() }
-	}
-	if len(addrs) == 2 {
-		a, b := addrs[0], addrs[1]
-		return func(ip netip.Addr) bool { return ip == a.Addr() || ip == b.Addr() }
-	}
-	// General case:
-	m := map[netip.Addr]bool{}
-	for _, a := range addrs {
-		m[a.Addr()] = true
-	}
-	return func(ip netip.Addr) bool { return m[ip] }
-}
-
 // PrefixesContainsIP reports whether any prefix in ipp contains ip.
 func PrefixesContainsIP(ipp []netip.Prefix, ip netip.Addr) bool {
 	for _, r := range ipp {
@@ -224,9 +184,9 @@ func PrefixIs6(p netip.Prefix) bool { return p.Addr().Is6() }
 
 // ContainsExitRoutes reports whether rr contains both the IPv4 and
 // IPv6 /0 route.
-func ContainsExitRoutes(rr []netip.Prefix) bool {
+func ContainsExitRoutes(rr views.Slice[netip.Prefix]) bool {
 	var v4, v6 bool
-	for _, r := range rr {
+	for _, r := range rr.All() {
 		if r == allIPv4 {
 			v4 = true
 		} else if r == allIPv6 {
@@ -234,6 +194,60 @@ func ContainsExitRoutes(rr []netip.Prefix) bool {
 		}
 	}
 	return v4 && v6
+}
+
+// ContainsExitRoute reports whether rr contains at least one of IPv4 or
+// IPv6 /0 (exit) routes.
+func ContainsExitRoute(rr views.Slice[netip.Prefix]) bool {
+	for _, r := range rr.All() {
+		if r.Bits() == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// ContainsNonExitSubnetRoutes reports whether v contains Subnet
+// Routes other than ExitNode Routes.
+func ContainsNonExitSubnetRoutes(rr views.Slice[netip.Prefix]) bool {
+	for _, r := range rr.All() {
+		if r.Bits() != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// WithoutExitRoutes returns rr unchanged if it has only 1 or 0 /0
+// routes. If it has both IPv4 and IPv6 /0 routes, then it returns
+// a copy with all /0 routes removed.
+func WithoutExitRoutes(rr views.Slice[netip.Prefix]) views.Slice[netip.Prefix] {
+	if !ContainsExitRoutes(rr) {
+		return rr
+	}
+	var out []netip.Prefix
+	for _, r := range rr.All() {
+		if r.Bits() > 0 {
+			out = append(out, r)
+		}
+	}
+	return views.SliceOf(out)
+}
+
+// WithoutExitRoute returns rr unchanged if it has 0 /0
+// routes. If it has a IPv4 or IPv6 /0 routes, then it returns
+// a copy with all /0 routes removed.
+func WithoutExitRoute(rr views.Slice[netip.Prefix]) views.Slice[netip.Prefix] {
+	if !ContainsExitRoute(rr) {
+		return rr
+	}
+	var out []netip.Prefix
+	for _, r := range rr.All() {
+		if r.Bits() > 0 {
+			out = append(out, r)
+		}
+	}
+	return views.SliceOf(out)
 }
 
 var (
@@ -250,22 +264,22 @@ func AllIPv6() netip.Prefix { return allIPv6 }
 // ExitRoutes returns a slice containing AllIPv4 and AllIPv6.
 func ExitRoutes() []netip.Prefix { return []netip.Prefix{allIPv4, allIPv6} }
 
+// IsExitRoute reports whether p is an exit node route.
+func IsExitRoute(p netip.Prefix) bool {
+	return p == allIPv4 || p == allIPv6
+}
+
 // SortPrefixes sorts the prefixes in place.
 func SortPrefixes(p []netip.Prefix) {
-	slices.SortFunc(p, func(ri, rj netip.Prefix) bool {
-		if ri.Addr() == rj.Addr() {
-			return ri.Bits() < rj.Bits()
-		}
-		return ri.Addr().Less(rj.Addr())
-	})
+	slices.SortFunc(p, netipx.ComparePrefix)
 }
 
 // FilterPrefixes returns a new slice, not aliasing in, containing elements of
 // in that match f.
-func FilterPrefixesCopy(in []netip.Prefix, f func(netip.Prefix) bool) []netip.Prefix {
+func FilterPrefixesCopy(in views.Slice[netip.Prefix], f func(netip.Prefix) bool) []netip.Prefix {
 	var out []netip.Prefix
-	for _, v := range in {
-		if f(v) {
+	for i := range in.Len() {
+		if v := in.At(i); f(v) {
 			out = append(out, v)
 		}
 	}

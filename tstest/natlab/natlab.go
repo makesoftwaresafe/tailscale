@@ -14,7 +14,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"os"
@@ -442,16 +442,6 @@ func (m *Machine) forwardPacket(p *Packet, iif *Interface) {
 	oif.net.write(p)
 }
 
-func unspecOf(ip netip.Addr) netip.Addr {
-	if ip.Is4() {
-		return v4unspec
-	}
-	if ip.Is6() {
-		return v6unspec
-	}
-	panic(fmt.Sprintf("bogus IP %#v", ip))
-}
-
 // Attach adds an interface to a machine.
 //
 // The first interface added to a Machine becomes that machine's
@@ -572,24 +562,11 @@ func (m *Machine) interfaceForIP(ip netip.Addr) (*Interface, error) {
 	return nil, fmt.Errorf("no route found to %v", ip)
 }
 
-func (m *Machine) hasv6() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, f := range m.interfaces {
-		for _, ip := range f.ips {
-			if ip.Is6() {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func (m *Machine) pickEphemPort() (port uint16, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for tries := 0; tries < 500; tries++ {
-		port := uint16(rand.Intn(32<<10) + 32<<10)
+		port := uint16(rand.IntN(32<<10) + 32<<10)
 		if !m.portInUseLocked(port) {
 			return port, nil
 		}
@@ -824,13 +801,21 @@ func (c *conn) Write(buf []byte) (int, error) {
 }
 
 func (c *conn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	n, ap, err := c.ReadFromUDPAddrPort(p)
+	if err != nil {
+		return 0, nil, err
+	}
+	return n, net.UDPAddrFromAddrPort(ap), nil
+}
+
+func (c *conn) ReadFromUDPAddrPort(p []byte) (n int, addr netip.AddrPort, err error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	ar := &activeRead{cancel: cancel}
 
 	if err := c.canRead(); err != nil {
-		return 0, nil, err
+		return 0, netip.AddrPort{}, err
 	}
 
 	c.registerActiveRead(ar, true)
@@ -840,14 +825,9 @@ func (c *conn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	case pkt := <-c.in:
 		n = copy(p, pkt.Payload)
 		pkt.Trace("PacketConn.ReadFrom")
-		ua := &net.UDPAddr{
-			IP:   pkt.Src.Addr().AsSlice(),
-			Port: int(pkt.Src.Port()),
-			Zone: pkt.Src.Addr().Zone(),
-		}
-		return n, ua, nil
+		return n, pkt.Src, nil
 	case <-ctx.Done():
-		return 0, nil, context.DeadlineExceeded
+		return 0, netip.AddrPort{}, context.DeadlineExceeded
 	}
 }
 

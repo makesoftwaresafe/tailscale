@@ -8,26 +8,25 @@ import (
 	"net/url"
 	"time"
 
+	"tailscale.com/health"
 	"tailscale.com/net/dnscache"
+	"tailscale.com/net/netmon"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 )
 
 const (
-	// upgradeHeader is the value of the Upgrade HTTP header used to
-	// indicate the Tailscale control protocol.
-	upgradeHeaderValue = "tailscale-control-protocol"
-
-	// handshakeHeaderName is the HTTP request header that can
-	// optionally contain base64-encoded initial handshake
-	// payload, to save an RTT.
-	handshakeHeaderName = "X-Tailscale-Handshake"
-
 	// serverUpgradePath is where the server-side HTTP handler to
 	// to do the protocol switch is located.
 	serverUpgradePath = "/ts2021"
 )
+
+// NoPort is a sentinel value for Dialer.HTTPSPort to indicate that HTTPS
+// should not be tried on any port. It exists primarily for some localhost
+// tests where the control plane only runs on HTTP.
+const NoPort = "none"
 
 // Dialer contains configuration on how to dial the Tailscale control server.
 type Dialer struct {
@@ -59,6 +58,8 @@ type Dialer struct {
 	// HTTPSPort is the port number to use when making a HTTPS connection.
 	//
 	// If not specified, this defaults to port 443.
+	//
+	// If "none" (NoPort), HTTPS is disabled.
 	HTTPSPort string
 
 	// Dialer is the dialer used to make outbound connections.
@@ -66,9 +67,21 @@ type Dialer struct {
 	// If not specified, this defaults to net.Dialer.DialContext.
 	Dialer dnscache.DialContextFunc
 
+	// DNSCache is the caching Resolver used by this Dialer.
+	//
+	// If not specified, a new Resolver is created per attempt.
+	DNSCache *dnscache.Resolver
+
 	// Logf, if set, is a logging function to use; if unset, logs are
 	// dropped.
 	Logf logger.Logf
+
+	// NetMon is the [netmon.Monitor] to use for this Dialer. It must be
+	// non-nil.
+	NetMon *netmon.Monitor
+
+	// HealthTracker, if non-nil, is the health tracker to use.
+	HealthTracker *health.Tracker
 
 	// DialPlan, if set, contains instructions from the control server on
 	// how to connect to it. If present, we will try the methods in this
@@ -81,6 +94,11 @@ type Dialer struct {
 	drainFinished        chan struct{}
 	omitCertErrorLogging bool
 	testFallbackDelay    time.Duration
+
+	// Clock, if non-nil, overrides the clock to use.
+	// If nil, tstime.StdClock is used.
+	// This exists primarily for tests.
+	Clock tstime.Clock
 }
 
 func strDef(v1, v2 string) string {

@@ -7,25 +7,53 @@
 package prober
 
 import (
+	"container/ring"
 	"context"
 	"encoding/json"
-	"errors"
-	"expvar"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"log"
+	"maps"
 	"math/rand"
-	"sort"
-	"strings"
+	"net/http"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"tailscale.com/tsweb"
 )
 
-// ProbeFunc is a function that probes something and reports whether
-// the probe succeeded. The provided context's deadline must be obeyed
-// for correct probe scheduling.
-type ProbeFunc func(context.Context) error
+// recentHistSize is the number of recent probe results and latencies to keep
+// in memory.
+const recentHistSize = 10
+
+// ProbeClass defines a probe of a specific type: a probing function that will
+// be regularly ran, and metric labels that will be added automatically to all
+// probes using this class.
+type ProbeClass struct {
+	// Probe is a function that probes something and reports whether the Probe
+	// succeeded. The provided context's deadline must be obeyed for correct
+	// Probe scheduling.
+	Probe func(context.Context) error
+
+	// Class defines a user-facing name of the probe class that will be used
+	// in the `class` metric label.
+	Class string
+
+	// Labels defines a set of metric labels that will be added to all metrics
+	// exposed by this probe class.
+	Labels Labels
+
+	// Metrics allows a probe class to export custom Metrics. Can be nil.
+	Metrics func(prometheus.Labels) []prometheus.Metric
+}
+
+// FuncProbe wraps a simple probe function in a ProbeClass.
+func FuncProbe(fn func(context.Context) error) ProbeClass {
+	return ProbeClass{
+		Probe: fn,
+	}
+}
 
 // a Prober manages a set of probes and keeps track of their results.
 type Prober struct {
@@ -42,6 +70,9 @@ type Prober struct {
 
 	mu     sync.Mutex // protects all following fields
 	probes map[string]*Probe
+
+	namespace string
+	metrics   *prometheus.Registry
 }
 
 // New returns a new Prober.
@@ -50,33 +81,49 @@ func New() *Prober {
 }
 
 func newForTest(now func() time.Time, newTicker func(time.Duration) ticker) *Prober {
-	return &Prober{
+	p := &Prober{
 		now:       now,
 		newTicker: newTicker,
 		probes:    map[string]*Probe{},
+		metrics:   prometheus.NewRegistry(),
+		namespace: "prober",
 	}
+	prometheus.DefaultRegisterer.MustRegister(p.metrics)
+	return p
 }
 
-// Expvar returns the metrics for running probes.
-func (p *Prober) Expvar() expvar.Var {
-	return varExporter{p}
-}
-
-// ProbeInfo returns information about most recent probe runs.
-func (p *Prober) ProbeInfo() map[string]ProbeInfo {
-	return varExporter{p}.probeInfo()
-}
-
-// Run executes fun every interval, and exports probe results under probeName.
+// Run executes probe class function every interval, and exports probe results under probeName.
+//
+// If interval is negative, the probe will run continuously. If it encounters a failure while
+// running continuously, it will pause for -1*interval and then retry.
 //
 // Registering a probe under an already-registered name panics.
-func (p *Prober) Run(name string, interval time.Duration, labels map[string]string, fun ProbeFunc) *Probe {
+func (p *Prober) Run(name string, interval time.Duration, labels Labels, pc ProbeClass) *Probe {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.probes[name]; ok {
 		panic(fmt.Sprintf("probe named %q already registered", name))
 	}
 
+	l := prometheus.Labels{
+		"name":  name,
+		"class": pc.Class,
+	}
+	for k, v := range pc.Labels {
+		l[k] = v
+	}
+	for k, v := range labels {
+		l[k] = v
+	}
+
+	probe := newProbe(p, name, interval, l, pc)
+	p.probes[name] = probe
+	go probe.loop()
+	return probe
+}
+
+// newProbe creates a new Probe with the given parameters, but does not start it.
+func newProbe(p *Prober, name string, interval time.Duration, l prometheus.Labels, pc ProbeClass) *Probe {
 	ctx, cancel := context.WithCancel(context.Background())
 	probe := &Probe{
 		prober:  p,
@@ -85,19 +132,39 @@ func (p *Prober) Run(name string, interval time.Duration, labels map[string]stri
 		stopped: make(chan struct{}),
 
 		name:         name,
-		doProbe:      fun,
+		probeClass:   pc,
 		interval:     interval,
 		initialDelay: initialDelay(name, interval),
-		labels:       labels,
+		successHist:  ring.New(recentHistSize),
+		latencyHist:  ring.New(recentHistSize),
+
+		metrics:      prometheus.NewRegistry(),
+		metricLabels: l,
+		mInterval:    prometheus.NewDesc("interval_secs", "Probe interval in seconds", nil, l),
+		mStartTime:   prometheus.NewDesc("start_secs", "Latest probe start time (seconds since epoch)", nil, l),
+		mEndTime:     prometheus.NewDesc("end_secs", "Latest probe end time (seconds since epoch)", nil, l),
+		mLatency:     prometheus.NewDesc("latency_millis", "Latest probe latency (ms)", nil, l),
+		mResult:      prometheus.NewDesc("result", "Latest probe result (1 = success, 0 = failure)", nil, l),
+		mAttempts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "attempts_total", Help: "Total number of probing attempts", ConstLabels: l,
+		}, []string{"status"}),
+		mSeconds: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "seconds_total", Help: "Total amount of time spent executing the probe", ConstLabels: l,
+		}, []string{"status"}),
 	}
-	p.probes[name] = probe
-	go probe.loop()
+	if p.metrics != nil {
+		prometheus.WrapRegistererWithPrefix(p.namespace+"_", p.metrics).MustRegister(probe.metrics)
+	}
+	probe.metrics.MustRegister(probe)
 	return probe
 }
 
+// unregister removes a probe from the prober's internal state.
 func (p *Prober) unregister(probe *Probe) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	probe.metrics.Unregister(probe)
+	p.metrics.Unregister(probe.metrics)
 	name := probe.name
 	delete(p.probes, name)
 }
@@ -113,6 +180,12 @@ func (p *Prober) WithSpread(s bool) *Prober {
 // rather than on a schedule.
 func (p *Prober) WithOnce(s bool) *Prober {
 	p.once = s
+	return p
+}
+
+// WithMetricNamespace allows changing metric name prefix from the default `prober`.
+func (p *Prober) WithMetricNamespace(n string) *Prober {
+	p.namespace = n
 	return p
 }
 
@@ -153,13 +226,26 @@ type Probe struct {
 	ctx     context.Context
 	cancel  context.CancelFunc // run to initiate shutdown
 	stopped chan struct{}      // closed when shutdown is complete
+	runMu   sync.Mutex         // ensures only one probe runs at a time
 
 	name         string
-	doProbe      ProbeFunc
+	probeClass   ProbeClass
 	interval     time.Duration
 	initialDelay time.Duration
 	tick         ticker
-	labels       map[string]string
+
+	// metrics is a Prometheus metrics registry for metrics exported by this probe.
+	// Using a separate registry allows cleanly removing metrics exported by this
+	// probe when it gets unregistered.
+	metrics      *prometheus.Registry
+	metricLabels prometheus.Labels
+	mInterval    *prometheus.Desc
+	mStartTime   *prometheus.Desc
+	mEndTime     *prometheus.Desc
+	mLatency     *prometheus.Desc
+	mResult      *prometheus.Desc
+	mAttempts    *prometheus.CounterVec
+	mSeconds     *prometheus.CounterVec
 
 	mu        sync.Mutex
 	start     time.Time     // last time doProbe started
@@ -167,6 +253,15 @@ type Probe struct {
 	latency   time.Duration // last successful probe latency
 	succeeded bool          // whether the last doProbe call succeeded
 	lastErr   error
+
+	// History of recent probe results and latencies.
+	successHist *ring.Ring
+	latencyHist *ring.Ring
+}
+
+// IsContinuous indicates that this is a continuous probe.
+func (p *Probe) IsContinuous() bool {
+	return p.interval < 0
 }
 
 // Close shuts down the Probe and unregisters it from its Prober.
@@ -201,6 +296,22 @@ func (p *Probe) loop() {
 		return
 	}
 
+	if p.IsContinuous() {
+		// Probe function is going to run continuously.
+		for {
+			p.run()
+			// Wait and then retry if probe fails. We use the inverse of the
+			// configured negative interval as our sleep period.
+			// TODO(percy):implement exponential backoff, possibly using logtail/backoff.
+			select {
+			case <-time.After(-1 * p.interval):
+				p.run()
+			case <-p.ctx.Done():
+				return
+			}
+		}
+	}
+
 	p.tick = p.prober.newTicker(p.interval)
 	defer p.tick.Stop()
 	for {
@@ -213,13 +324,17 @@ func (p *Probe) loop() {
 	}
 }
 
-// run invokes fun and records the results.
+// run invokes the probe function and records the result. It returns the probe
+// result and an error if the probe failed.
 //
-// fun is invoked with a timeout slightly less than interval, so that
-// the probe either succeeds or fails before the next cycle is
-// scheduled to start.
-func (p *Probe) run() {
-	start := p.recordStart()
+// The probe function is invoked with a timeout slightly less than interval, so
+// that the probe either succeeds or fails before the next cycle is scheduled to
+// start.
+func (p *Probe) run() (pi ProbeInfo, err error) {
+	p.runMu.Lock()
+	defer p.runMu.Unlock()
+
+	p.recordStart()
 	defer func() {
 		// Prevent a panic within one probe function from killing the
 		// entire prober, so that a single buggy probe doesn't destroy
@@ -228,152 +343,260 @@ func (p *Probe) run() {
 		// alert for debugging.
 		if r := recover(); r != nil {
 			log.Printf("probe %s panicked: %v", p.name, r)
-			p.recordEnd(start, errors.New("panic"))
+			err = fmt.Errorf("panic: %v", r)
+			p.recordEnd(err)
 		}
 	}()
-	timeout := time.Duration(float64(p.interval) * 0.8)
-	ctx, cancel := context.WithTimeout(p.ctx, timeout)
-	defer cancel()
+	ctx := p.ctx
+	if !p.IsContinuous() {
+		timeout := time.Duration(float64(p.interval) * 0.8)
+		var cancel func()
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 
-	err := p.doProbe(ctx)
-	p.recordEnd(start, err)
+	err = p.probeClass.Probe(ctx)
+	p.recordEnd(err)
 	if err != nil {
 		log.Printf("probe %s: %v", p.name, err)
 	}
+	pi = p.probeInfoLocked()
+	return
 }
 
-func (p *Probe) recordStart() time.Time {
-	st := p.prober.now()
+func (p *Probe) recordStart() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.start = st
-	return st
+	p.start = p.prober.now()
+	p.mu.Unlock()
 }
 
-func (p *Probe) recordEnd(start time.Time, err error) {
+func (p *Probe) recordEnd(err error) {
 	end := p.prober.now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.end = end
 	p.succeeded = err == nil
 	p.lastErr = err
+	latency := end.Sub(p.start)
 	if p.succeeded {
-		p.latency = end.Sub(p.start)
+		p.latency = latency
+		p.mAttempts.WithLabelValues("ok").Inc()
+		p.mSeconds.WithLabelValues("ok").Add(latency.Seconds())
+		p.latencyHist.Value = latency
+		p.latencyHist = p.latencyHist.Next()
 	} else {
 		p.latency = 0
+		p.mAttempts.WithLabelValues("fail").Inc()
+		p.mSeconds.WithLabelValues("fail").Add(latency.Seconds())
 	}
+	p.successHist.Value = p.succeeded
+	p.successHist = p.successHist.Next()
 }
 
-type varExporter struct {
-	p *Prober
-}
+// ProbeStatus indicates the status of a probe.
+type ProbeStatus string
 
-// ProbeInfo is the state of a Probe. Used in expvar-format debug
-// data.
+const (
+	ProbeStatusUnknown   = "unknown"
+	ProbeStatusRunning   = "running"
+	ProbeStatusFailed    = "failed"
+	ProbeStatusSucceeded = "succeeded"
+)
+
+// ProbeInfo is a snapshot of the configuration and state of a Probe.
 type ProbeInfo struct {
-	Labels  map[string]string
-	Start   time.Time
-	End     time.Time
-	Latency string // as a string because time.Duration doesn't encode readably to JSON
-	Result  bool
-	Error   string
+	Name            string
+	Class           string
+	Interval        time.Duration
+	Labels          map[string]string
+	Start           time.Time
+	End             time.Time
+	Latency         time.Duration
+	Status          ProbeStatus
+	Error           string
+	RecentResults   []bool
+	RecentLatencies []time.Duration
 }
 
-func (v varExporter) probeInfo() map[string]ProbeInfo {
+// RecentSuccessRatio returns the success ratio of the probe in the recent history.
+func (pb ProbeInfo) RecentSuccessRatio() float64 {
+	if len(pb.RecentResults) == 0 {
+		return 0
+	}
+	var sum int
+	for _, r := range pb.RecentResults {
+		if r {
+			sum++
+		}
+	}
+	return float64(sum) / float64(len(pb.RecentResults))
+}
+
+// RecentMedianLatency returns the median latency of the probe in the recent history.
+func (pb ProbeInfo) RecentMedianLatency() time.Duration {
+	if len(pb.RecentLatencies) == 0 {
+		return 0
+	}
+	return pb.RecentLatencies[len(pb.RecentLatencies)/2]
+}
+
+func (pb ProbeInfo) Continuous() bool {
+	return pb.Interval < 0
+}
+
+// ProbeInfo returns the state of all probes.
+func (p *Prober) ProbeInfo() map[string]ProbeInfo {
 	out := map[string]ProbeInfo{}
 
-	v.p.mu.Lock()
-	probes := make([]*Probe, 0, len(v.p.probes))
-	for _, probe := range v.p.probes {
+	p.mu.Lock()
+	probes := make([]*Probe, 0, len(p.probes))
+	for _, probe := range p.probes {
 		probes = append(probes, probe)
 	}
-	v.p.mu.Unlock()
-
+	p.mu.Unlock()
 	for _, probe := range probes {
 		probe.mu.Lock()
-		inf := ProbeInfo{
-			Labels: probe.labels,
-			Start:  probe.start,
-			End:    probe.end,
-			Result: probe.succeeded,
-		}
-		if probe.lastErr != nil {
-			inf.Error = probe.lastErr.Error()
-		}
-		if probe.latency > 0 {
-			inf.Latency = probe.latency.String()
-		}
-		out[probe.name] = inf
+		out[probe.name] = probe.probeInfoLocked()
 		probe.mu.Unlock()
 	}
 	return out
 }
 
-// String implements expvar.Var, returning the prober's state as an
-// encoded JSON map of probe name to its ProbeInfo.
-func (v varExporter) String() string {
-	bs, err := json.Marshal(v.probeInfo())
-	if err != nil {
-		return fmt.Sprintf(`{"error": %q}`, err)
+// probeInfoLocked returns the state of the probe.
+func (probe *Probe) probeInfoLocked() ProbeInfo {
+	inf := ProbeInfo{
+		Name:     probe.name,
+		Class:    probe.probeClass.Class,
+		Interval: probe.interval,
+		Labels:   probe.metricLabels,
+		Start:    probe.start,
+		End:      probe.end,
 	}
-	return string(bs)
+	inf.Status = ProbeStatusUnknown
+	if probe.end.Before(probe.start) {
+		inf.Status = ProbeStatusRunning
+	} else if probe.succeeded {
+		inf.Status = ProbeStatusSucceeded
+	} else if probe.lastErr != nil {
+		inf.Status = ProbeStatusFailed
+		inf.Error = probe.lastErr.Error()
+	}
+	if probe.latency > 0 {
+		inf.Latency = probe.latency
+	}
+	probe.latencyHist.Do(func(v any) {
+		if l, ok := v.(time.Duration); ok {
+			inf.RecentLatencies = append(inf.RecentLatencies, l)
+		}
+	})
+	probe.successHist.Do(func(v any) {
+		if r, ok := v.(bool); ok {
+			inf.RecentResults = append(inf.RecentResults, r)
+		}
+	})
+	return inf
 }
 
-// WritePrometheus writes the state of all probes to w.
-//
-// For each probe, WritePrometheus exports 5 variables:
-//   - <prefix>_interval_secs, how frequently the probe runs.
-//   - <prefix>_start_secs, when the probe last started running, in seconds since epoch.
-//   - <prefix>_end_secs, when the probe last finished running, in seconds since epoch.
-//   - <prefix>_latency_millis, how long the last probe cycle took, in
-//     milliseconds. This is just (end_secs-start_secs) in an easier to
-//     graph form.
-//   - <prefix>_result, 1 if the last probe succeeded, 0 if it failed.
-//
-// Each probe has a set of static key/value labels (defined once at
-// probe creation), which are added as Prometheus metric labels to
-// that probe's variables.
-func (v varExporter) WritePrometheus(w io.Writer, prefix string) {
-	v.p.mu.Lock()
-	probes := make([]*Probe, 0, len(v.p.probes))
-	for _, probe := range v.p.probes {
-		probes = append(probes, probe)
+// RunHandlerResponse is the JSON response format for the RunHandler.
+type RunHandlerResponse struct {
+	ProbeInfo             ProbeInfo
+	PreviousSuccessRatio  float64
+	PreviousMedianLatency time.Duration
+}
+
+// RunHandler runs a probe by name and returns the result as an HTTP response.
+func (p *Prober) RunHandler(w http.ResponseWriter, r *http.Request) error {
+	// Look up prober by name.
+	name := r.FormValue("name")
+	if name == "" {
+		return tsweb.Error(http.StatusBadRequest, "missing name parameter", nil)
 	}
-	v.p.mu.Unlock()
+	p.mu.Lock()
+	probe, ok := p.probes[name]
+	p.mu.Unlock()
+	if !ok || probe.IsContinuous() {
+		return tsweb.Error(http.StatusNotFound, fmt.Sprintf("unknown probe %q", name), nil)
+	}
 
-	sort.Slice(probes, func(i, j int) bool {
-		return probes[i].name < probes[j].name
-	})
-	for _, probe := range probes {
-		probe.mu.Lock()
-		keys := make([]string, 0, len(probe.labels))
-		for k := range probe.labels {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "name=%q", probe.name)
-		for _, k := range keys {
-			fmt.Fprintf(&sb, ",%s=%q", k, probe.labels[k])
-		}
-		labels := sb.String()
+	probe.mu.Lock()
+	prevInfo := probe.probeInfoLocked()
+	probe.mu.Unlock()
 
-		fmt.Fprintf(w, "%s_interval_secs{%s} %f\n", prefix, labels, probe.interval.Seconds())
-		if !probe.start.IsZero() {
-			fmt.Fprintf(w, "%s_start_secs{%s} %d\n", prefix, labels, probe.start.Unix())
+	info, err := probe.run()
+	respStatus := http.StatusOK
+	if err != nil {
+		respStatus = http.StatusFailedDependency
+	}
+
+	// Return serialized JSON response if the client requested JSON
+	if r.Header.Get("Accept") == "application/json" {
+		resp := &RunHandlerResponse{
+			ProbeInfo:             info,
+			PreviousSuccessRatio:  prevInfo.RecentSuccessRatio(),
+			PreviousMedianLatency: prevInfo.RecentMedianLatency(),
 		}
-		if !probe.end.IsZero() {
-			fmt.Fprintf(w, "%s_end_secs{%s} %d\n", prefix, labels, probe.end.Unix())
-			if probe.latency > 0 {
-				fmt.Fprintf(w, "%s_latency_millis{%s} %d\n", prefix, labels, probe.latency.Milliseconds())
-			}
-			if probe.succeeded {
-				fmt.Fprintf(w, "%s_result{%s} 1\n", prefix, labels)
-			} else {
-				fmt.Fprintf(w, "%s_result{%s} 0\n", prefix, labels)
-			}
+		w.WriteHeader(respStatus)
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			return tsweb.Error(http.StatusInternalServerError, "error encoding JSON response", err)
 		}
-		probe.mu.Unlock()
+		return nil
+	}
+
+	stats := fmt.Sprintf("Last %d probes: success rate %d%%, median latency %v\n",
+		len(prevInfo.RecentResults),
+		int(prevInfo.RecentSuccessRatio()*100), prevInfo.RecentMedianLatency())
+	if err != nil {
+		return tsweb.Error(respStatus, fmt.Sprintf("Probe failed: %s\n%s", err.Error(), stats), err)
+	}
+	w.WriteHeader(respStatus)
+	w.Write([]byte(fmt.Sprintf("Probe succeeded in %v\n%s", info.Latency, stats)))
+	return nil
+}
+
+// Describe implements prometheus.Collector.
+func (p *Probe) Describe(ch chan<- *prometheus.Desc) {
+	ch <- p.mInterval
+	ch <- p.mStartTime
+	ch <- p.mEndTime
+	ch <- p.mResult
+	ch <- p.mLatency
+	p.mAttempts.Describe(ch)
+	p.mSeconds.Describe(ch)
+	if p.probeClass.Metrics != nil {
+		for _, m := range p.probeClass.Metrics(p.metricLabels) {
+			ch <- m.Desc()
+		}
+	}
+}
+
+// Collect implements prometheus.Collector.
+func (p *Probe) Collect(ch chan<- prometheus.Metric) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ch <- prometheus.MustNewConstMetric(p.mInterval, prometheus.GaugeValue, p.interval.Seconds())
+	if !p.start.IsZero() {
+		ch <- prometheus.MustNewConstMetric(p.mStartTime, prometheus.GaugeValue, float64(p.start.Unix()))
+	}
+	// For periodic probes that haven't ended, don't collect probe metrics yet.
+	if p.end.IsZero() && !p.IsContinuous() {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(p.mEndTime, prometheus.GaugeValue, float64(p.end.Unix()))
+	if p.succeeded {
+		ch <- prometheus.MustNewConstMetric(p.mResult, prometheus.GaugeValue, 1)
+	} else {
+		ch <- prometheus.MustNewConstMetric(p.mResult, prometheus.GaugeValue, 0)
+	}
+	if p.latency > 0 {
+		ch <- prometheus.MustNewConstMetric(p.mLatency, prometheus.GaugeValue, float64(p.latency.Milliseconds()))
+	}
+	p.mAttempts.Collect(ch)
+	p.mSeconds.Collect(ch)
+	if p.probeClass.Metrics != nil {
+		for _, m := range p.probeClass.Metrics(p.metricLabels) {
+			ch <- m
+		}
 	}
 }
 
@@ -402,4 +625,13 @@ func initialDelay(seed string, interval time.Duration) time.Duration {
 	fmt.Fprint(h, seed)
 	r := rand.New(rand.NewSource(int64(h.Sum64()))).Float64()
 	return time.Duration(float64(interval) * r)
+}
+
+// Labels is a set of metric labels used by a prober.
+type Labels map[string]string
+
+func (l Labels) With(k, v string) Labels {
+	new := maps.Clone(l)
+	new[k] = v
+	return new
 }

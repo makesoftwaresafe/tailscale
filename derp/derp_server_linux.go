@@ -9,51 +9,46 @@ import (
 	"net"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"tailscale.com/net/tcpinfo"
 )
 
-func (c *sclient) statsLoop(ctx context.Context) error {
-	// If we can't get a TCP socket, then we can't send stats.
-	tcpConn := c.tcpConn()
-	if tcpConn == nil {
+func (c *sclient) startStatsLoop(ctx context.Context) {
+	// Get the RTT initially to verify it's supported.
+	conn := c.tcpConn()
+	if conn == nil {
 		c.s.tcpRtt.Add("non-tcp", 1)
-		return nil
+		return
 	}
-	rawConn, err := tcpConn.SyscallConn()
-	if err != nil {
-		c.logf("error getting SyscallConn: %v", err)
+	if _, err := tcpinfo.RTT(conn); err != nil {
+		c.logf("error fetching initial RTT: %v", err)
 		c.s.tcpRtt.Add("error", 1)
-		return nil
+		return
 	}
 
 	const statsInterval = 10 * time.Second
 
-	ticker := time.NewTicker(statsInterval)
-	defer ticker.Stop()
-
-	var (
-		tcpInfo *unix.TCPInfo
-		sysErr  error
-	)
-statsLoop:
-	for {
-		select {
-		case <-ticker.C:
-			err = rawConn.Control(func(fd uintptr) {
-				tcpInfo, sysErr = unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO)
-			})
-			if err != nil || sysErr != nil {
-				continue statsLoop
-			}
-
-			// TODO(andrew): more metrics?
-			rtt := time.Duration(tcpInfo.Rtt) * time.Microsecond
-			c.s.tcpRtt.Add(durationToLabel(rtt), 1)
-
-		case <-ctx.Done():
-			return ctx.Err()
+	// Don't launch a goroutine; use a timer instead.
+	var gatherStats func()
+	gatherStats = func() {
+		// Do nothing if the context is finished.
+		if ctx.Err() != nil {
+			return
 		}
+
+		// Reschedule ourselves when this stats gathering is finished.
+		defer c.s.clock.AfterFunc(statsInterval, gatherStats)
+
+		// Gather TCP RTT information.
+		rtt, err := tcpinfo.RTT(conn)
+		if err == nil {
+			c.s.tcpRtt.Add(durationToLabel(rtt), 1)
+		}
+
+		// TODO(andrew): more metrics?
 	}
+
+	// Kick off the initial timer.
+	c.s.clock.AfterFunc(statsInterval, gatherStats)
 }
 
 // tcpConn attempts to get the underlying *net.TCPConn from this client's

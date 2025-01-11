@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -600,7 +601,7 @@ type compactingChonkFake struct {
 
 func (c *compactingChonkFake) AllAUMs() ([]AUMHash, error) {
 	out := make([]AUMHash, 0, len(c.Mem.aums))
-	for h, _ := range c.Mem.aums {
+	for h := range c.Mem.aums {
 		out = append(out, h)
 	}
 	return out, nil
@@ -618,6 +619,14 @@ func (c *compactingChonkFake) PurgeAUMs(hashes []AUMHash) error {
 		c.t.Errorf("deletion set differs (-want, +got):\n%s", diff)
 	}
 	return nil
+}
+
+// Avoid go vet complaining about copying a lock value
+func cloneMem(src, dst *Mem) {
+	dst.l = sync.RWMutex{}
+	dst.aums = src.aums
+	dst.parentIndex = src.parentIndex
+	dst.lastActiveAncestor = src.lastActiveAncestor
 }
 
 func TestCompact(t *testing.T) {
@@ -661,11 +670,12 @@ func TestCompact(t *testing.T) {
     `, optTemplate("checkpoint", AUM{MessageKind: AUMCheckpoint, State: fakeState}))
 
 	storage := &compactingChonkFake{
-		Mem:        (*c.Chonk().(*Mem)),
 		aumAge:     map[AUMHash]time.Time{(c.AUMHashes["F1"]): time.Now()},
 		t:          t,
 		wantDelete: []AUMHash{c.AUMHashes["A"], c.AUMHashes["B"], c.AUMHashes["OLD"]},
 	}
+
+	cloneMem(c.Chonk().(*Mem), &storage.Mem)
 
 	lastActiveAncestor, err := Compact(storage, c.AUMHashes["H"], CompactionOptions{MinChain: 2, MinAge: time.Hour})
 	if err != nil {

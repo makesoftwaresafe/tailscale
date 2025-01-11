@@ -4,11 +4,15 @@
 package safesocket
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"runtime"
 	"testing"
 )
+
+// downgradeSDDL is a no-op test helper on non-Windows systems.
+var downgradeSDDL = func() func() { return func() {} }
 
 func TestBasics(t *testing.T) {
 	// Make the socket in a temp dir rather than the cwd
@@ -19,9 +23,10 @@ func TestBasics(t *testing.T) {
 		sock = filepath.Join(dir, "test")
 	} else {
 		sock = fmt.Sprintf(`\\.\pipe\tailscale-test`)
+		t.Cleanup(downgradeSDDL())
 	}
 
-	l, err := Listen(sock)
+	ln, err := Listen(sock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,12 +34,12 @@ func TestBasics(t *testing.T) {
 	errs := make(chan error, 2)
 
 	go func() {
-		s, err := l.Accept()
+		s, err := ln.Accept()
 		if err != nil {
 			errs <- err
 			return
 		}
-		l.Close()
+		ln.Close()
 		s.Write([]byte("hello"))
 
 		b := make([]byte, 1024)
@@ -53,8 +58,7 @@ func TestBasics(t *testing.T) {
 	}()
 
 	go func() {
-		s := DefaultConnectionStrategy(sock)
-		c, err := Connect(s)
+		c, err := ConnectContext(context.Background(), sock)
 		if err != nil {
 			errs <- err
 			return
@@ -73,7 +77,7 @@ func TestBasics(t *testing.T) {
 		errs <- nil
 	}()
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if err := <-errs; err != nil {
 			t.Fatal(err)
 		}

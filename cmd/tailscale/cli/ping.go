@@ -16,13 +16,15 @@ import (
 	"time"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
+	"tailscale.com/client/tailscale"
+	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 )
 
 var pingCmd = &ffcli.Command{
 	Name:       "ping",
-	ShortUsage: "ping <hostname-or-IP>",
+	ShortUsage: "tailscale ping <hostname-or-IP>",
 	ShortHelp:  "Ping a host at the Tailscale layer, see how it routed",
 	LongHelp: strings.TrimSpace(`
 
@@ -51,14 +53,25 @@ relay node.
 		fs.BoolVar(&pingArgs.tsmp, "tsmp", false, "do a TSMP-level ping (through WireGuard, but not either host OS stack)")
 		fs.BoolVar(&pingArgs.icmp, "icmp", false, "do a ICMP-level ping (through WireGuard, but not the local host OS stack)")
 		fs.BoolVar(&pingArgs.peerAPI, "peerapi", false, "try hitting the peer's peerapi HTTP server")
-		fs.IntVar(&pingArgs.num, "c", 10, "max number of pings to send")
+		fs.IntVar(&pingArgs.num, "c", 10, "max number of pings to send. 0 for infinity.")
 		fs.DurationVar(&pingArgs.timeout, "timeout", 5*time.Second, "timeout before giving up on a ping")
+		fs.IntVar(&pingArgs.size, "size", 0, "size of the ping message (disco pings only). 0 for minimum size.")
 		return fs
 	})(),
 }
 
+func init() {
+	ffcomplete.Args(pingCmd, func(args []string) ([]string, ffcomplete.ShellCompDirective, error) {
+		if len(args) > 1 {
+			return nil, ffcomplete.ShellCompDirectiveNoFileComp, nil
+		}
+		return completeHostOrIP(ffcomplete.LastArg(args))
+	})
+}
+
 var pingArgs struct {
 	num         int
+	size        int
 	untilDirect bool
 	verbose     bool
 	tsmp        bool
@@ -92,7 +105,7 @@ func runPing(ctx context.Context, args []string) error {
 	}
 
 	if len(args) != 1 || args[0] == "" {
-		return errors.New("usage: ping <hostname-or-IP>")
+		return errors.New("usage: tailscale ping <hostname-or-IP>")
 	}
 	var ip string
 
@@ -115,7 +128,7 @@ func runPing(ctx context.Context, args []string) error {
 	for {
 		n++
 		ctx, cancel := context.WithTimeout(ctx, pingArgs.timeout)
-		pr, err := localClient.Ping(ctx, netip.MustParseAddr(ip), pingType())
+		pr, err := localClient.PingWithOpts(ctx, netip.MustParseAddr(ip), pingType(), tailscale.PingOpts{Size: pingArgs.size})
 		cancel()
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {

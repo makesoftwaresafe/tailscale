@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !windows
+//go:build !windows && !plan9
 
 package vms
 
@@ -50,7 +50,7 @@ func (vm *vmInstance) running() bool {
 
 func (vm *vmInstance) waitStartup(t *testing.T) {
 	t.Helper()
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		if vm.running() {
 			break
 		}

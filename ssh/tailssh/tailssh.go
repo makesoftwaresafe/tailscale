@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,13 +20,13 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	gossh "github.com/tailscale/golang-x-crypto/ssh"
@@ -36,16 +35,22 @@ import (
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
+	"tailscale.com/sessionrecording"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tempfork/gliderlabs/ssh"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/httpm"
 	"tailscale.com/util/mak"
 )
 
 var (
-	sshVerboseLogging = envknob.RegisterBool("TS_DEBUG_SSH_VLOG")
+	sshVerboseLogging    = envknob.RegisterBool("TS_DEBUG_SSH_VLOG")
+	sshDisableSFTP       = envknob.RegisterBool("TS_SSH_DISABLE_SFTP")
+	sshDisableForwarding = envknob.RegisterBool("TS_SSH_DISABLE_FORWARDING")
+	sshDisablePTY        = envknob.RegisterBool("TS_SSH_DISABLE_PTY")
 )
 
 const (
@@ -61,9 +66,11 @@ type ipnLocalBackend interface {
 	GetSSH_HostKeys() ([]gossh.Signer, error)
 	ShouldRunSSH() bool
 	NetMap() *netmap.NetworkMap
-	WhoIs(ipp netip.AddrPort) (n *tailcfg.Node, u tailcfg.UserProfile, ok bool)
+	WhoIs(proto string, ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool)
 	DoNoiseRequest(req *http.Request) (*http.Response, error)
 	Dialer() *tsdial.Dialer
+	TailscaleVarRoot() string
+	NodeKey() key.NodePublic
 }
 
 type server struct {
@@ -71,38 +78,14 @@ type server struct {
 	logf           logger.Logf
 	tailscaledPath string
 
-	pubKeyHTTPClient *http.Client     // or nil for http.DefaultClient
-	timeNow          func() time.Time // or nil for time.Now
+	timeNow func() time.Time // or nil for time.Now
 
 	sessionWaitGroup sync.WaitGroup
 
 	// mu protects the following
-	mu                   sync.Mutex
-	httpc                *http.Client                // for calling out to peers.
-	activeConns          map[*conn]bool              // set; value is always true
-	fetchPublicKeysCache map[string]pubKeyCacheEntry // by https URL
-	shutdownCalled       bool
-}
-
-// sessionRecordingClient returns an http.Client that uses srv.lb.Dialer() to
-// dial connections. This is used to make requests to the session recording
-// server to upload session recordings.
-func (srv *server) sessionRecordingClient() *http.Client {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-	if srv.httpc != nil {
-		return srv.httpc
-	}
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		return srv.lb.Dialer().UserDial(ctx, network, addr)
-	}
-	srv.httpc = &http.Client{
-		Transport: tr,
-	}
-	return srv.httpc
+	mu             sync.Mutex
+	activeConns    map[*conn]bool // set; value is always true
+	shutdownCalled bool
 }
 
 func (srv *server) now() time.Time {
@@ -122,7 +105,11 @@ func init() {
 			lb:             lb,
 			logf:           logf,
 			tailscaledPath: tsd,
+			timeNow: func() time.Time {
+				return lb.ControlNow(time.Now())
+			},
 		}
+
 		return srv, nil
 	})
 }
@@ -150,6 +137,13 @@ func (srv *server) trackActiveConn(c *conn, add bool) {
 		return
 	}
 	delete(srv.activeConns, c)
+}
+
+// NumActiveConns returns the number of active SSH connections.
+func (srv *server) NumActiveConns() int {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	return len(srv.activeConns)
 }
 
 // HandleSSHConn handles a Tailscale SSH connection from c.
@@ -206,7 +200,6 @@ func (srv *server) OnPolicyChange() {
 //
 // Do the user auth
 //   - NoClientAuthHandler
-//   - PublicKeyHandler (only if NoClientAuthHandler returns errPubKeyRequired)
 //
 // Once auth is done, the conn can be multiplexed with multiple sessions and
 // channels concurrently. At which point any of the following can be called
@@ -236,10 +229,10 @@ type conn struct {
 	finalAction    *tailcfg.SSHAction // set by doPolicyAuth or resolveNextAction
 	finalActionErr error              // set by doPolicyAuth or resolveNextAction
 
-	info         *sshConnInfo    // set by setInfo
-	localUser    *user.User      // set by doPolicyAuth
-	userGroupIDs []string        // set by doPolicyAuth
-	pubKey       gossh.PublicKey // set by doPolicyAuth
+	info         *sshConnInfo // set by setInfo
+	localUser    *userMeta    // set by doPolicyAuth
+	userGroupIDs []string     // set by doPolicyAuth
+	acceptEnv    []string
 
 	// mu protects the following fields.
 	//
@@ -255,21 +248,24 @@ func (c *conn) logf(format string, args ...any) {
 	c.srv.logf(format, args...)
 }
 
+func (c *conn) vlogf(format string, args ...any) {
+	if sshVerboseLogging() {
+		c.logf(format, args...)
+	}
+}
+
 // isAuthorized walks through the action chain and returns nil if the connection
 // is authorized. If the connection is not authorized, it returns
-// gossh.ErrDenied. If the action chain resolution fails, it returns the
+// errDenied. If the action chain resolution fails, it returns the
 // resolution error.
 func (c *conn) isAuthorized(ctx ssh.Context) error {
 	action := c.currentAction
 	for {
 		if action.Accept {
-			if c.pubKey != nil {
-				metricPublicKeyAccepts.Add(1)
-			}
 			return nil
 		}
 		if action.Reject || action.HoldAndDelegate == "" {
-			return gossh.ErrDenied
+			return errDenied
 		}
 		var err error
 		action, err = c.resolveNextAction(ctx)
@@ -284,9 +280,9 @@ func (c *conn) isAuthorized(ctx ssh.Context) error {
 	}
 }
 
-// errPubKeyRequired is returned by NoClientAuthCallback to make the client
-// resort to public-key auth; not user visible.
-var errPubKeyRequired = errors.New("ssh publickey required")
+// errDenied is returned by auth callbacks when a connection is denied by the
+// policy.
+var errDenied = errors.New("ssh: access denied")
 
 // NoClientAuthCallback implements gossh.NoClientAuthCallback and is called by
 // the ssh.Server when the client first connects with the "none"
@@ -296,13 +292,12 @@ var errPubKeyRequired = errors.New("ssh publickey required")
 // starting it afresh). It returns an error if the policy evaluation fails, or
 // if the decision is "reject"
 //
-// It either returns nil (accept) or errPubKeyRequired or gossh.ErrDenied
-// (reject). The errors may be wrapped.
+// It either returns nil (accept) or errDenied (reject). The errors may be wrapped.
 func (c *conn) NoClientAuthCallback(ctx ssh.Context) error {
 	if c.insecureSkipTailscaleAuth {
 		return nil
 	}
-	if err := c.doPolicyAuth(ctx, nil /* no pub key */); err != nil {
+	if err := c.doPolicyAuth(ctx); err != nil {
 		return err
 	}
 	if err := c.isAuthorized(ctx); err != nil {
@@ -323,8 +318,6 @@ func (c *conn) nextAuthMethodCallback(cm gossh.ConnMetadata, prevErrors []error)
 	switch {
 	case c.anyPasswordIsOkay:
 		nextMethod = append(nextMethod, "password")
-	case len(prevErrors) > 0 && prevErrors[len(prevErrors)-1] == errPubKeyRequired:
-		nextMethod = append(nextMethod, "publickey")
 	}
 
 	// The fake "tailscale" method is always appended to next so OpenSSH renders
@@ -344,41 +337,21 @@ func (c *conn) fakePasswordHandler(ctx ssh.Context, password string) bool {
 	return c.anyPasswordIsOkay
 }
 
-// PublicKeyHandler implements ssh.PublicKeyHandler is called by the
-// ssh.Server when the client presents a public key.
-func (c *conn) PublicKeyHandler(ctx ssh.Context, pubKey ssh.PublicKey) error {
-	if err := c.doPolicyAuth(ctx, pubKey); err != nil {
-		// TODO(maisem/bradfitz): surface the error here.
-		c.logf("rejecting SSH public key %s: %v", bytes.TrimSpace(gossh.MarshalAuthorizedKey(pubKey)), err)
-		return err
-	}
-	if err := c.isAuthorized(ctx); err != nil {
-		return err
-	}
-	c.logf("accepting SSH public key %s", bytes.TrimSpace(gossh.MarshalAuthorizedKey(pubKey)))
-	return nil
-}
-
-// doPolicyAuth verifies that conn can proceed with the specified (optional)
-// pubKey. It returns nil if the matching policy action is Accept or
-// HoldAndDelegate. If pubKey is nil, there was no policy match but there is a
-// policy that might match a public key it returns errPubKeyRequired. Otherwise,
-// it returns gossh.ErrDenied.
-func (c *conn) doPolicyAuth(ctx ssh.Context, pubKey ssh.PublicKey) error {
+// doPolicyAuth verifies that conn can proceed.
+// It returns nil if the matching policy action is Accept or
+// HoldAndDelegate. Otherwise, it returns errDenied.
+func (c *conn) doPolicyAuth(ctx ssh.Context) error {
 	if err := c.setInfo(ctx); err != nil {
 		c.logf("failed to get conninfo: %v", err)
-		return gossh.ErrDenied
+		return errDenied
 	}
-	a, localUser, err := c.evaluatePolicy(pubKey)
+	a, localUser, acceptEnv, err := c.evaluatePolicy()
 	if err != nil {
-		if pubKey == nil && c.havePubKeyPolicy() {
-			return errPubKeyRequired
-		}
-		return fmt.Errorf("%w: %v", gossh.ErrDenied, err)
+		return fmt.Errorf("%w: %v", errDenied, err)
 	}
 	c.action0 = a
 	c.currentAction = a
-	c.pubKey = pubKey
+	c.acceptEnv = acceptEnv
 	if a.Message != "" {
 		if err := ctx.SendAuthBanner(a.Message); err != nil {
 			return fmt.Errorf("SendBanner: %w", err)
@@ -388,7 +361,7 @@ func (c *conn) doPolicyAuth(ctx ssh.Context, pubKey ssh.PublicKey) error {
 		if a.Accept {
 			c.finalAction = a
 		}
-		lu, err := user.Lookup(localUser)
+		lu, err := userLookup(localUser)
 		if err != nil {
 			c.logf("failed to look up %v: %v", localUser, err)
 			ctx.SendAuthBanner(fmt.Sprintf("failed to look up %v\r\n", localUser))
@@ -396,6 +369,7 @@ func (c *conn) doPolicyAuth(ctx ssh.Context, pubKey ssh.PublicKey) error {
 		}
 		gids, err := lu.GroupIds()
 		if err != nil {
+			c.logf("failed to look up local user's group IDs: %v", err)
 			return err
 		}
 		c.userGroupIDs = gids
@@ -404,10 +378,10 @@ func (c *conn) doPolicyAuth(ctx ssh.Context, pubKey ssh.PublicKey) error {
 	}
 	if a.Reject {
 		c.finalAction = a
-		return gossh.ErrDenied
+		return errDenied
 	}
 	// Shouldn't get here, but:
-	return gossh.ErrDenied
+	return errDenied
 }
 
 // ServerConfig implements ssh.ServerConfigCallback.
@@ -425,22 +399,23 @@ func (srv *server) newConn() (*conn, error) {
 		// Stop accepting new connections.
 		// Connections in the auth phase are handled in handleConnPostSSHAuth.
 		// Existing sessions are terminated by Shutdown.
-		return nil, gossh.ErrDenied
+		return nil, errDenied
 	}
 	srv.mu.Unlock()
 	c := &conn{srv: srv}
 	now := srv.now()
 	c.connID = fmt.Sprintf("ssh-conn-%s-%02x", now.UTC().Format("20060102T150405"), randBytes(5))
+	fwdHandler := &ssh.ForwardedTCPHandler{}
 	c.Server = &ssh.Server{
 		Version:              "Tailscale",
 		ServerConfigCallback: c.ServerConfig,
 
 		NoClientAuthHandler: c.NoClientAuthCallback,
-		PublicKeyHandler:    c.PublicKeyHandler,
 		PasswordHandler:     c.fakePasswordHandler,
 
-		Handler:                     c.handleSessionPostSSHAuth,
-		LocalPortForwardingCallback: c.mayForwardLocalPortTo,
+		Handler:                       c.handleSessionPostSSHAuth,
+		LocalPortForwardingCallback:   c.mayForwardLocalPortTo,
+		ReversePortForwardingCallback: c.mayReversePortForwardTo,
 		SubsystemHandlers: map[string]ssh.SubsystemHandler{
 			"sftp": c.handleSessionPostSSHAuth,
 		},
@@ -450,7 +425,10 @@ func (srv *server) newConn() (*conn, error) {
 		ChannelHandlers: map[string]ssh.ChannelHandler{
 			"direct-tcpip": ssh.DirectTCPIPHandler,
 		},
-		RequestHandlers: map[string]ssh.RequestHandler{},
+		RequestHandlers: map[string]ssh.RequestHandler{
+			"tcpip-forward":        fwdHandler.HandleSSHRequest,
+			"cancel-tcpip-forward": fwdHandler.HandleSSHRequest,
+		},
 	}
 	ss := c.Server
 	for k, v := range ssh.DefaultRequestHandlers {
@@ -472,41 +450,30 @@ func (srv *server) newConn() (*conn, error) {
 	return c, nil
 }
 
-// mayForwardLocalPortTo reports whether the ctx should be allowed to port forward
+// mayReversePortPortForwardTo reports whether the ctx should be allowed to port forward
 // to the specified host and port.
 // TODO(bradfitz/maisem): should we have more checks on host/port?
-func (c *conn) mayForwardLocalPortTo(ctx ssh.Context, destinationHost string, destinationPort uint32) bool {
-	if c.finalAction != nil && c.finalAction.AllowLocalPortForwarding {
-		metricLocalPortForward.Add(1)
+func (c *conn) mayReversePortForwardTo(ctx ssh.Context, destinationHost string, destinationPort uint32) bool {
+	if sshDisableForwarding() {
+		return false
+	}
+	if c.finalAction != nil && c.finalAction.AllowRemotePortForwarding {
+		metricRemotePortForward.Add(1)
 		return true
 	}
 	return false
 }
 
-// havePubKeyPolicy reports whether any policy rule may provide access by means
-// of a ssh.PublicKey.
-func (c *conn) havePubKeyPolicy() bool {
-	if c.info == nil {
-		panic("havePubKeyPolicy called before setInfo")
-	}
-	// Is there any rule that looks like it'd require a public key for this
-	// sshUser?
-	pol, ok := c.sshPolicy()
-	if !ok {
+// mayForwardLocalPortTo reports whether the ctx should be allowed to port forward
+// to the specified host and port.
+// TODO(bradfitz/maisem): should we have more checks on host/port?
+func (c *conn) mayForwardLocalPortTo(ctx ssh.Context, destinationHost string, destinationPort uint32) bool {
+	if sshDisableForwarding() {
 		return false
 	}
-	for _, r := range pol.Rules {
-		if c.ruleExpired(r) {
-			continue
-		}
-		if mapLocalUser(r.SSHUsers, c.info.sshUser) == "" {
-			continue
-		}
-		for _, p := range r.Principals {
-			if len(p.PubKeys) > 0 && c.principalMatchesTailscaleIdentity(p) {
-				return true
-			}
-		}
+	if c.finalAction != nil && c.finalAction.AllowLocalPortForwarding {
+		metricLocalPortForward.Add(1)
+		return true
 	}
 	return false
 }
@@ -573,7 +540,7 @@ func (c *conn) setInfo(ctx ssh.Context) error {
 	if !tsaddr.IsTailscaleIP(ci.src.Addr()) {
 		return fmt.Errorf("tailssh: rejecting non-Tailscale remote address %v", ci.src)
 	}
-	node, uprof, ok := c.srv.lb.WhoIs(ci.src)
+	node, uprof, ok := c.srv.lb.WhoIs("tcp", ci.src)
 	if !ok {
 		return fmt.Errorf("unknown Tailscale identity from src %v", ci.src)
 	}
@@ -587,115 +554,17 @@ func (c *conn) setInfo(ctx ssh.Context) error {
 }
 
 // evaluatePolicy returns the SSHAction and localUser after evaluating
-// the SSHPolicy for this conn. The pubKey may be nil for "none" auth.
-func (c *conn) evaluatePolicy(pubKey gossh.PublicKey) (_ *tailcfg.SSHAction, localUser string, _ error) {
+// the SSHPolicy for this conn.
+func (c *conn) evaluatePolicy() (_ *tailcfg.SSHAction, localUser string, acceptEnv []string, _ error) {
 	pol, ok := c.sshPolicy()
 	if !ok {
-		return nil, "", fmt.Errorf("tailssh: rejecting connection; no SSH policy")
+		return nil, "", nil, fmt.Errorf("tailssh: rejecting connection; no SSH policy")
 	}
-	a, localUser, ok := c.evalSSHPolicy(pol, pubKey)
+	a, localUser, acceptEnv, ok := c.evalSSHPolicy(pol)
 	if !ok {
-		return nil, "", fmt.Errorf("tailssh: rejecting connection; no matching policy")
+		return nil, "", nil, fmt.Errorf("tailssh: rejecting connection; no matching policy")
 	}
-	return a, localUser, nil
-}
-
-// pubKeyCacheEntry is the cache value for an HTTPS URL of public keys (like
-// "https://github.com/foo.keys")
-type pubKeyCacheEntry struct {
-	lines []string
-	etag  string // if sent by server
-	at    time.Time
-}
-
-const (
-	pubKeyCacheDuration      = time.Minute      // how long to cache non-empty public keys
-	pubKeyCacheEmptyDuration = 15 * time.Second // how long to cache empty responses
-)
-
-func (srv *server) fetchPublicKeysURLCached(url string) (ce pubKeyCacheEntry, ok bool) {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-	// Mostly don't care about the size of this cache. Clean rarely.
-	if m := srv.fetchPublicKeysCache; len(m) > 50 {
-		tooOld := srv.now().Add(pubKeyCacheDuration * 10)
-		for k, ce := range m {
-			if ce.at.Before(tooOld) {
-				delete(m, k)
-			}
-		}
-	}
-	ce, ok = srv.fetchPublicKeysCache[url]
-	if !ok {
-		return ce, false
-	}
-	maxAge := pubKeyCacheDuration
-	if len(ce.lines) == 0 {
-		maxAge = pubKeyCacheEmptyDuration
-	}
-	return ce, srv.now().Sub(ce.at) < maxAge
-}
-
-func (srv *server) pubKeyClient() *http.Client {
-	if srv.pubKeyHTTPClient != nil {
-		return srv.pubKeyHTTPClient
-	}
-	return http.DefaultClient
-}
-
-// fetchPublicKeysURL fetches the public keys from a URL. The strings are in the
-// the typical public key "type base64-string [comment]" format seen at e.g.
-// https://github.com/USER.keys
-func (srv *server) fetchPublicKeysURL(url string) ([]string, error) {
-	if !strings.HasPrefix(url, "https://") {
-		return nil, errors.New("invalid URL scheme")
-	}
-
-	ce, ok := srv.fetchPublicKeysURLCached(url)
-	if ok {
-		return ce.lines, nil
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	if ce.etag != "" {
-		req.Header.Add("If-None-Match", ce.etag)
-	}
-	res, err := srv.pubKeyClient().Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	var lines []string
-	var etag string
-	switch res.StatusCode {
-	default:
-		err = fmt.Errorf("unexpected status %v", res.Status)
-		srv.logf("fetching public keys from %s: %v", url, err)
-	case http.StatusNotModified:
-		lines = ce.lines
-		etag = ce.etag
-	case http.StatusOK:
-		var all []byte
-		all, err = io.ReadAll(io.LimitReader(res.Body, 4<<10))
-		if s := strings.TrimSpace(string(all)); s != "" {
-			lines = strings.Split(s, "\n")
-		}
-		etag = res.Header.Get("Etag")
-	}
-
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-	mak.Set(&srv.fetchPublicKeysCache, url, pubKeyCacheEntry{
-		at:    srv.now(),
-		lines: lines,
-		etag:  etag,
-	})
-	return lines, err
+	return a, localUser, acceptEnv, nil
 }
 
 // handleSessionPostSSHAuth runs an SSH session after the SSH-level authentication,
@@ -704,8 +573,15 @@ func (srv *server) fetchPublicKeysURL(url string) ([]string, error) {
 func (c *conn) handleSessionPostSSHAuth(s ssh.Session) {
 	// Do this check after auth, but before starting the session.
 	switch s.Subsystem() {
-	case "sftp", "":
+	case "sftp":
+		if sshDisableSFTP() {
+			fmt.Fprintf(s.Stderr(), "sftp disabled\r\n")
+			s.Exit(1)
+			return
+		}
 		metricSFTP.Add(1)
+	case "":
+		// Regular SSH session.
 	default:
 		fmt.Fprintf(s.Stderr(), "Unsupported subsystem %q\r\n", s.Subsystem())
 		s.Exit(1)
@@ -780,28 +656,16 @@ func (c *conn) expandDelegateURLLocked(actionURL string) string {
 	lu := c.localUser
 	var dstNodeID string
 	if nm != nil {
-		dstNodeID = fmt.Sprint(int64(nm.SelfNode.ID))
+		dstNodeID = fmt.Sprint(int64(nm.SelfNode.ID()))
 	}
 	return strings.NewReplacer(
 		"$SRC_NODE_IP", url.QueryEscape(ci.src.Addr().String()),
-		"$SRC_NODE_ID", fmt.Sprint(int64(ci.node.ID)),
+		"$SRC_NODE_ID", fmt.Sprint(int64(ci.node.ID())),
 		"$DST_NODE_IP", url.QueryEscape(ci.dst.Addr().String()),
 		"$DST_NODE_ID", dstNodeID,
 		"$SSH_USER", url.QueryEscape(ci.sshUser),
 		"$LOCAL_USER", url.QueryEscape(lu.Username),
 	).Replace(actionURL)
-}
-
-func (c *conn) expandPublicKeyURL(pubKeyURL string) string {
-	if !strings.Contains(pubKeyURL, "$") {
-		return pubKeyURL
-	}
-	loginName := c.info.uprof.LoginName
-	localPart, _, _ := strings.Cut(loginName, "@")
-	return strings.NewReplacer(
-		"$LOGINNAME_EMAIL", loginName,
-		"$LOGINNAME_LOCALPART", localPart,
-	).Replace(pubKeyURL)
 }
 
 // sshSession is an accepted Tailscale SSH session.
@@ -816,18 +680,23 @@ type sshSession struct {
 	agentListener net.Listener // non-nil if agent-forwarding requested+allowed
 
 	// initialized by launchProcess:
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
-	stderr io.Reader // nil for pty sessions
-	ptyReq *ssh.Pty  // non-nil for pty sessions
+	cmd      *exec.Cmd
+	wrStdin  io.WriteCloser
+	rdStdout io.ReadCloser
+	rdStderr io.ReadCloser // rdStderr is nil for pty sessions
+	ptyReq   *ssh.Pty      // non-nil for pty sessions
+
+	// childPipes is a list of pipes that need to be closed when the process exits.
+	// For pty sessions, this is the tty fd.
+	// For non-pty sessions, this is the stdin, stdout, stderr fds.
+	childPipes []io.Closer
 
 	// We use this sync.Once to ensure that we only terminate the process once,
 	// either it exits itself or is terminated
 	exitOnce sync.Once
 }
 
-func (ss *sshSession) vlogf(format string, args ...interface{}) {
+func (ss *sshSession) vlogf(format string, args ...any) {
 	if sshVerboseLogging() {
 		ss.logf(format, args...)
 	}
@@ -849,7 +718,8 @@ func (c *conn) newSSHSession(s ssh.Session) *sshSession {
 
 // isStillValid reports whether the conn is still valid.
 func (c *conn) isStillValid() bool {
-	a, localUser, err := c.evaluatePolicy(c.pubKey)
+	a, localUser, _, err := c.evaluatePolicy()
+	c.vlogf("stillValid: %+v %v %v", a, localUser, err)
 	if err != nil {
 		return false
 	}
@@ -968,8 +838,14 @@ var errSessionDone = errors.New("session is done")
 // handleSSHAgentForwarding starts a Unix socket listener and in the background
 // forwards agent connections between the listener and the ssh.Session.
 // On success, it assigns ss.agentListener.
-func (ss *sshSession) handleSSHAgentForwarding(s ssh.Session, lu *user.User) error {
+func (ss *sshSession) handleSSHAgentForwarding(s ssh.Session, lu *userMeta) error {
 	if !ssh.AgentRequested(ss) || !ss.conn.finalAction.AllowAgentForwarding {
+		return nil
+	}
+	if sshDisableForwarding() {
+		// TODO(bradfitz): or do we want to return an error here instead so the user
+		// gets an error if they ran with ssh -A? But for now we just silently
+		// don't work, like the condition above.
 		return nil
 	}
 	ss.logf("ssh: agent forwarding requested")
@@ -1067,7 +943,7 @@ func (ss *sshSession) run() {
 			if err != nil {
 				var uve userVisibleError
 				if errors.As(err, &uve) {
-					fmt.Fprintf(ss, "%s\r\n", uve)
+					fmt.Fprintf(ss, "%s\r\n", uve.SSHTerminationMessage())
 				} else {
 					fmt.Fprintf(ss, "can't start new recording\r\n")
 				}
@@ -1075,7 +951,10 @@ func (ss *sshSession) run() {
 				ss.Exit(1)
 				return
 			}
-			defer rec.Close()
+			ss.logf("startNewRecording: <nil>")
+			if rec != nil {
+				defer rec.Close()
+			}
 		}
 	}
 
@@ -1094,48 +973,67 @@ func (ss *sshSession) run() {
 	}
 	go ss.killProcessOnContextDone()
 
+	var processDone atomic.Bool
 	go func() {
-		defer ss.stdin.Close()
-		if _, err := io.Copy(rec.writer("i", ss.stdin), ss); err != nil {
+		defer ss.wrStdin.Close()
+		if _, err := io.Copy(rec.writer("i", ss.wrStdin), ss); err != nil {
 			logf("stdin copy: %v", err)
 			ss.cancelCtx(err)
 		}
 	}()
+	outputDone := make(chan struct{})
 	var openOutputStreams atomic.Int32
-	if ss.stderr != nil {
+	if ss.rdStderr != nil {
 		openOutputStreams.Store(2)
 	} else {
 		openOutputStreams.Store(1)
 	}
 	go func() {
-		defer ss.stdout.Close()
-		_, err := io.Copy(rec.writer("o", ss), ss.stdout)
+		defer ss.rdStdout.Close()
+		_, err := io.Copy(rec.writer("o", ss), ss.rdStdout)
 		if err != nil && !errors.Is(err, io.EOF) {
-			logf("stdout copy: %v", err)
-			ss.cancelCtx(err)
+			isErrBecauseProcessExited := processDone.Load() && errors.Is(err, syscall.EIO)
+			if !isErrBecauseProcessExited {
+				logf("stdout copy: %v", err)
+				ss.cancelCtx(err)
+			}
 		}
 		if openOutputStreams.Add(-1) == 0 {
 			ss.CloseWrite()
+			close(outputDone)
 		}
 	}()
-	// stderr is nil for ptys.
-	if ss.stderr != nil {
+	// rdStderr is nil for ptys.
+	if ss.rdStderr != nil {
 		go func() {
-			_, err := io.Copy(ss.Stderr(), ss.stderr)
+			defer ss.rdStderr.Close()
+			_, err := io.Copy(ss.Stderr(), ss.rdStderr)
 			if err != nil {
 				logf("stderr copy: %v", err)
 			}
 			if openOutputStreams.Add(-1) == 0 {
 				ss.CloseWrite()
+				close(outputDone)
 			}
 		}()
 	}
 
 	err = ss.cmd.Wait()
+	processDone.Store(true)
+
 	// This will either make the SSH Termination goroutine be a no-op,
 	// or itself will be a no-op because the process was killed by the
 	// aforementioned goroutine.
 	ss.exitOnce.Do(func() {})
+
+	// Close the process-side of all pipes to signal the asynchronous
+	// io.Copy routines reading/writing from the pipes to terminate.
+	// Block for the io.Copy to finish before calling ss.Exit below.
+	closeAll(ss.childPipes...)
+	select {
+	case <-outputDone:
+	case <-ss.ctx.Done():
+	}
 
 	if err == nil {
 		ss.logf("Session complete")
@@ -1154,19 +1052,25 @@ func (ss *sshSession) run() {
 	return
 }
 
+// recordSSHToLocalDisk is a deprecated dev knob to allow recording SSH sessions
+// to local storage. It is only used if there is no recording configured by the
+// coordination server. This will be removed in the future.
+var recordSSHToLocalDisk = envknob.RegisterBool("TS_DEBUG_LOG_SSH")
+
 // recorders returns the list of recorders to use for this session.
 // If the final action has a non-empty list of recorders, that list is
 // returned. Otherwise, the list of recorders from the initial action
 // is returned.
-func (ss *sshSession) recorders() []netip.AddrPort {
+func (ss *sshSession) recorders() ([]netip.AddrPort, *tailcfg.SSHRecorderFailureAction) {
 	if len(ss.conn.finalAction.Recorders) > 0 {
-		return ss.conn.finalAction.Recorders
+		return ss.conn.finalAction.Recorders, ss.conn.finalAction.OnRecordingFailure
 	}
-	return ss.conn.action0.Recorders
+	return ss.conn.action0.Recorders, ss.conn.action0.OnRecordingFailure
 }
 
 func (ss *sshSession) shouldRecord() bool {
-	return len(ss.recorders()) > 0
+	recs, _ := ss.recorders()
+	return len(recs) > 0 || recordSSHToLocalDisk()
 }
 
 type sshConnInfo struct {
@@ -1180,7 +1084,7 @@ type sshConnInfo struct {
 	dst netip.AddrPort
 
 	// node is srcIP's node.
-	node *tailcfg.Node
+	node tailcfg.NodeView
 
 	// uprof is node's UserProfile.
 	uprof tailcfg.UserProfile
@@ -1197,13 +1101,13 @@ func (c *conn) ruleExpired(r *tailcfg.SSHRule) bool {
 	return r.RuleExpires.Before(c.srv.now())
 }
 
-func (c *conn) evalSSHPolicy(pol *tailcfg.SSHPolicy, pubKey gossh.PublicKey) (a *tailcfg.SSHAction, localUser string, ok bool) {
+func (c *conn) evalSSHPolicy(pol *tailcfg.SSHPolicy) (a *tailcfg.SSHAction, localUser string, acceptEnv []string, ok bool) {
 	for _, r := range pol.Rules {
-		if a, localUser, err := c.matchRule(r, pubKey); err == nil {
-			return a, localUser, true
+		if a, localUser, acceptEnv, err := c.matchRule(r); err == nil {
+			return a, localUser, acceptEnv, true
 		}
 	}
-	return nil, "", false
+	return nil, "", nil, false
 }
 
 // internal errors for testing; they don't escape to callers or logs.
@@ -1216,22 +1120,26 @@ var (
 	errInvalidConn    = errors.New("invalid connection state")
 )
 
-func (c *conn) matchRule(r *tailcfg.SSHRule, pubKey gossh.PublicKey) (a *tailcfg.SSHAction, localUser string, err error) {
+func (c *conn) matchRule(r *tailcfg.SSHRule) (a *tailcfg.SSHAction, localUser string, acceptEnv []string, err error) {
+	defer func() {
+		c.vlogf("matchRule(%+v): %v", r, err)
+	}()
+
 	if c == nil {
-		return nil, "", errInvalidConn
+		return nil, "", nil, errInvalidConn
 	}
 	if c.info == nil {
 		c.logf("invalid connection state")
-		return nil, "", errInvalidConn
+		return nil, "", nil, errInvalidConn
 	}
 	if r == nil {
-		return nil, "", errNilRule
+		return nil, "", nil, errNilRule
 	}
 	if r.Action == nil {
-		return nil, "", errNilAction
+		return nil, "", nil, errNilAction
 	}
 	if c.ruleExpired(r) {
-		return nil, "", errRuleExpired
+		return nil, "", nil, errRuleExpired
 	}
 	if !r.Action.Reject {
 		// For all but Reject rules, SSHUsers is required.
@@ -1239,15 +1147,13 @@ func (c *conn) matchRule(r *tailcfg.SSHRule, pubKey gossh.PublicKey) (a *tailcfg
 		// empty string anyway.
 		localUser = mapLocalUser(r.SSHUsers, c.info.sshUser)
 		if localUser == "" {
-			return nil, "", errUserMatch
+			return nil, "", nil, errUserMatch
 		}
 	}
-	if ok, err := c.anyPrincipalMatches(r.Principals, pubKey); err != nil {
-		return nil, "", err
-	} else if !ok {
-		return nil, "", errPrincipalMatch
+	if !c.anyPrincipalMatches(r.Principals) {
+		return nil, "", nil, errPrincipalMatch
 	}
-	return r.Action, localUser, nil
+	return r.Action, localUser, r.AcceptEnv, nil
 }
 
 func mapLocalUser(ruleSSHUsers map[string]string, reqSSHUser string) (localUser string) {
@@ -1261,36 +1167,26 @@ func mapLocalUser(ruleSSHUsers map[string]string, reqSSHUser string) (localUser 
 	return v
 }
 
-func (c *conn) anyPrincipalMatches(ps []*tailcfg.SSHPrincipal, pubKey gossh.PublicKey) (bool, error) {
+func (c *conn) anyPrincipalMatches(ps []*tailcfg.SSHPrincipal) bool {
 	for _, p := range ps {
 		if p == nil {
 			continue
 		}
-		if ok, err := c.principalMatches(p, pubKey); err != nil {
-			return false, err
-		} else if ok {
-			return true, nil
+		if c.principalMatchesTailscaleIdentity(p) {
+			return true
 		}
 	}
-	return false, nil
-}
-
-func (c *conn) principalMatches(p *tailcfg.SSHPrincipal, pubKey gossh.PublicKey) (bool, error) {
-	if !c.principalMatchesTailscaleIdentity(p) {
-		return false, nil
-	}
-	return c.principalMatchesPubKey(p, pubKey)
+	return false
 }
 
 // principalMatchesTailscaleIdentity reports whether one of p's four fields
 // that match the Tailscale identity match (Node, NodeIP, UserLogin, Any).
-// This function does not consider PubKeys.
 func (c *conn) principalMatchesTailscaleIdentity(p *tailcfg.SSHPrincipal) bool {
 	ci := c.info
 	if p.Any {
 		return true
 	}
-	if !p.Node.IsZero() && ci.node != nil && p.Node == ci.node.StableID {
+	if !p.Node.IsZero() && ci.node.Valid() && p.Node == ci.node.StableID() {
 		return true
 	}
 	if p.NodeIP != "" {
@@ -1304,42 +1200,6 @@ func (c *conn) principalMatchesTailscaleIdentity(p *tailcfg.SSHPrincipal) bool {
 	return false
 }
 
-func (c *conn) principalMatchesPubKey(p *tailcfg.SSHPrincipal, clientPubKey gossh.PublicKey) (bool, error) {
-	if len(p.PubKeys) == 0 {
-		return true, nil
-	}
-	if clientPubKey == nil {
-		return false, nil
-	}
-	knownKeys := p.PubKeys
-	if len(knownKeys) == 1 && strings.HasPrefix(knownKeys[0], "https://") {
-		var err error
-		knownKeys, err = c.srv.fetchPublicKeysURL(c.expandPublicKeyURL(knownKeys[0]))
-		if err != nil {
-			return false, err
-		}
-	}
-	for _, knownKey := range knownKeys {
-		if pubKeyMatchesAuthorizedKey(clientPubKey, knownKey) {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func pubKeyMatchesAuthorizedKey(pubKey ssh.PublicKey, wantKey string) bool {
-	wantKeyType, rest, ok := strings.Cut(wantKey, " ")
-	if !ok {
-		return false
-	}
-	if pubKey.Type() != wantKeyType {
-		return false
-	}
-	wantKeyB64, _, _ := strings.Cut(rest, " ")
-	wantKeyData, _ := base64.StdEncoding.DecodeString(wantKeyB64)
-	return len(wantKeyData) > 0 && bytes.Equal(pubKey.Marshal(), wantKeyData)
-}
-
 func randBytes(n int) []byte {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -1348,65 +1208,40 @@ func randBytes(n int) []byte {
 	return b
 }
 
-// CastHeader is the header of an asciinema file.
-type CastHeader struct {
-	// Version is the asciinema file format version.
-	Version int `json:"version"`
-
-	// Width is the terminal width in characters.
-	// It is non-zero for Pty sessions.
-	Width int `json:"width"`
-
-	// Height is the terminal height in characters.
-	// It is non-zero for Pty sessions.
-	Height int `json:"height"`
-
-	// Timestamp is the unix timestamp of when the recording started.
-	Timestamp int64 `json:"timestamp"`
-
-	// Env is the environment variables of the session.
-	// Only "TERM" is set (2023-03-22).
-	Env map[string]string `json:"env"`
-
-	// Command is the command that was executed.
-	// Typically empty for shell sessions.
-	Command string `json:"command,omitempty"`
-
-	// Tailscale-specific fields:
-	// SrcNode is the FQDN of the node originating the connection.
-	// It is also the MagicDNS name for the node.
-	// It does not have a trailing dot.
-	// e.g. "host.tail-scale.ts.net"
-	SrcNode string `json:"srcNode"`
-
-	// SrcNodeID is the node ID of the node originating the connection.
-	SrcNodeID tailcfg.StableNodeID `json:"srcNodeID"`
-
-	// SrcNodeTags is the list of tags on the node originating the connection (if any).
-	SrcNodeTags []string `json:"srcNodeTags,omitempty"`
-
-	// SrcNodeUserID is the user ID of the node originating the connection (if not tagged).
-	SrcNodeUserID tailcfg.UserID `json:"srcNodeUserID,omitempty"` // if not tagged
-
-	// SrcNodeUser is the LoginName of the node originating the connection (if not tagged).
-	SrcNodeUser string `json:"srcNodeUser,omitempty"`
-
-	// SSHUser is the username as presented by the client.
-	SSHUser string `json:"sshUser"` // as presented by the client
-
-	// LocalUser is the effective username on the server.
-	LocalUser string `json:"localUser"`
+func (ss *sshSession) openFileForRecording(now time.Time) (_ io.WriteCloser, err error) {
+	varRoot := ss.conn.srv.lb.TailscaleVarRoot()
+	if varRoot == "" {
+		return nil, errors.New("no var root for recording storage")
+	}
+	dir := filepath.Join(varRoot, "ssh-sessions")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, err
+	}
+	f, err := os.CreateTemp(dir, fmt.Sprintf("ssh-session-%v-*.cast", now.UnixNano()))
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 
 // startNewRecording starts a new SSH session recording.
+// It may return a nil recording if recording is not available.
 func (ss *sshSession) startNewRecording() (_ *recording, err error) {
-	recorders := ss.recorders()
-	if len(recorders) == 0 {
-		return nil, errors.New("no recorders configured")
+	// We store the node key as soon as possible when creating
+	// a new recording incase of FUS.
+	nodeKey := ss.conn.srv.lb.NodeKey()
+	if nodeKey.IsZero() {
+		return nil, errors.New("ssh server is unavailable: no node key")
 	}
-	recorder := recorders[0]
-	if len(recorders) > 1 {
-		ss.logf("warning: multiple recorders configured, using first one: %v", recorder)
+
+	recorders, onFailure := ss.recorders()
+	var localRecording bool
+	if len(recorders) == 0 {
+		if recordSSHToLocalDisk() {
+			localRecording = true
+		} else {
+			return nil, errors.New("no recorders configured")
+		}
 	}
 
 	var w ssh.Window
@@ -1421,57 +1256,79 @@ func (ss *sshSession) startNewRecording() (_ *recording, err error) {
 
 	now := time.Now()
 	rec := &recording{
-		ss:    ss,
-		start: now,
+		ss:       ss,
+		start:    now,
+		failOpen: onFailure == nil || onFailure.TerminateSessionWithMessage == "",
 	}
-
-	pr, pw := io.Pipe()
 
 	// We want to use a background context for uploading and not ss.ctx.
 	// ss.ctx is closed when the session closes, but we don't want to break the upload at that time.
 	// Instead we want to wait for the session to close the writer when it finishes.
 	ctx := context.Background()
-	req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("http://%s:%d/record", recorder.Addr(), recorder.Port()), pr)
-	if err != nil {
-		pr.Close()
-		pw.Close()
-		return nil, err
-	}
-	// We want to wait for the server to respond with 100 Continue to notifiy us
-	// that it's ready to receive data. We do this to block the session from
-	// starting until the server is ready to receive data.
-	// It also allows the server to reject the request before we start sending
-	// data.
-	req.Header.Set("Expect", "100-continue")
-	go func() {
-		defer pw.Close()
-		ss.logf("starting asciinema recording to %s", recorder)
-		hc := ss.conn.srv.sessionRecordingClient()
-		resp, err := hc.Do(req)
+	if localRecording {
+		rec.out, err = ss.openFileForRecording(now)
 		if err != nil {
-			err := fmt.Errorf("recording: error sending recording: %w", err)
-			ss.logf("%v", err)
-			ss.cancelCtx(userVisibleError{
-				msg:   "recording: error sending recording",
-				error: err,
-			})
-			return
+			return nil, err
 		}
-		defer resp.Body.Close()
-		defer ss.cancelCtx(errors.New("recording: done"))
-		if resp.StatusCode != http.StatusOK {
-			err := fmt.Errorf("recording: server responded with %s", resp.Status)
-			ss.logf("%v", err)
-			ss.cancelCtx(userVisibleError{
-				msg:   "recording server responded with: " + resp.Status,
-				error: err,
-			})
+	} else {
+		var errChan <-chan error
+		var attempts []*tailcfg.SSHRecordingAttempt
+		rec.out, attempts, errChan, err = sessionrecording.ConnectToRecorder(ctx, recorders, ss.conn.srv.lb.Dialer().UserDial)
+		if err != nil {
+			if onFailure != nil && onFailure.NotifyURL != "" && len(attempts) > 0 {
+				eventType := tailcfg.SSHSessionRecordingFailed
+				if onFailure.RejectSessionWithMessage != "" {
+					eventType = tailcfg.SSHSessionRecordingRejected
+				}
+				ss.notifyControl(ctx, nodeKey, eventType, attempts, onFailure.NotifyURL)
+			}
+
+			if onFailure != nil && onFailure.RejectSessionWithMessage != "" {
+				ss.logf("recording: error starting recording (rejecting session): %v", err)
+				return nil, userVisibleError{
+					error: err,
+					msg:   onFailure.RejectSessionWithMessage,
+				}
+			}
+			ss.logf("recording: error starting recording (failing open): %v", err)
+			return nil, nil
 		}
-	}()
+		go func() {
+			err := <-errChan
+			if err == nil {
+				select {
+				case <-ss.ctx.Done():
+					// Success.
+					ss.logf("recording: finished uploading recording")
+					return
+				default:
+					err = errors.New("recording upload ended before the SSH session")
+				}
+			}
+			if onFailure != nil && onFailure.NotifyURL != "" && len(attempts) > 0 {
+				lastAttempt := attempts[len(attempts)-1]
+				lastAttempt.FailureMessage = err.Error()
 
-	rec.out = pw
+				eventType := tailcfg.SSHSessionRecordingFailed
+				if onFailure.TerminateSessionWithMessage != "" {
+					eventType = tailcfg.SSHSessionRecordingTerminated
+				}
 
-	ch := CastHeader{
+				ss.notifyControl(ctx, nodeKey, eventType, attempts, onFailure.NotifyURL)
+			}
+			if onFailure != nil && onFailure.TerminateSessionWithMessage != "" {
+				ss.logf("recording: error uploading recording (closing session): %v", err)
+				ss.cancelCtx(userVisibleError{
+					error: err,
+					msg:   onFailure.TerminateSessionWithMessage,
+				})
+				return
+			}
+			ss.logf("recording: error uploading recording (failing open): %v", err)
+		}()
+	}
+
+	ch := sessionrecording.CastHeader{
 		Version:   2,
 		Width:     w.Width,
 		Height:    w.Height,
@@ -1488,23 +1345,24 @@ func (ss *sshSession) startNewRecording() (_ *recording, err error) {
 			// it. Then we can (1) make the cmd, (2) start the
 			// recording, (3) start the process.
 		},
-		SSHUser:   ss.conn.info.sshUser,
-		LocalUser: ss.conn.localUser.Username,
-		SrcNode:   strings.TrimSuffix(ss.conn.info.node.Name, "."),
-		SrcNodeID: ss.conn.info.node.StableID,
+		SSHUser:      ss.conn.info.sshUser,
+		LocalUser:    ss.conn.localUser.Username,
+		SrcNode:      strings.TrimSuffix(ss.conn.info.node.Name(), "."),
+		SrcNodeID:    ss.conn.info.node.StableID(),
+		ConnectionID: ss.conn.connID,
 	}
 	if !ss.conn.info.node.IsTagged() {
 		ch.SrcNodeUser = ss.conn.info.uprof.LoginName
-		ch.SrcNodeUserID = ss.conn.info.node.User
+		ch.SrcNodeUserID = ss.conn.info.node.User()
 	} else {
-		ch.SrcNodeTags = ss.conn.info.node.Tags
+		ch.SrcNodeTags = ss.conn.info.node.Tags().AsSlice()
 	}
 	j, err := json.Marshal(ch)
 	if err != nil {
 		return nil, err
 	}
 	j = append(j, '\n')
-	if _, err := pw.Write(j); err != nil {
+	if _, err := rec.out.Write(j); err != nil {
 		if errors.Is(err, io.ErrClosedPipe) && ss.ctx.Err() != nil {
 			// If we got an io.ErrClosedPipe, it's likely because
 			// the recording server closed the connection on us. Return
@@ -1516,10 +1374,53 @@ func (ss *sshSession) startNewRecording() (_ *recording, err error) {
 	return rec, nil
 }
 
+// notifyControl sends a SSHEventNotifyRequest to control over noise.
+// A SSHEventNotifyRequest is sent when an action or state reached during
+// an SSH session is a defined EventType.
+func (ss *sshSession) notifyControl(ctx context.Context, nodeKey key.NodePublic, notifyType tailcfg.SSHEventType, attempts []*tailcfg.SSHRecordingAttempt, url string) {
+	re := tailcfg.SSHEventNotifyRequest{
+		EventType:         notifyType,
+		ConnectionID:      ss.conn.connID,
+		CapVersion:        tailcfg.CurrentCapabilityVersion,
+		NodeKey:           nodeKey,
+		SrcNode:           ss.conn.info.node.ID(),
+		SSHUser:           ss.conn.info.sshUser,
+		LocalUser:         ss.conn.localUser.Username,
+		RecordingAttempts: attempts,
+	}
+
+	body, err := json.Marshal(re)
+	if err != nil {
+		ss.logf("notifyControl: unable to marshal SSHNotifyRequest:", err)
+		return
+	}
+
+	req, err := http.NewRequestWithContext(ctx, httpm.POST, url, bytes.NewReader(body))
+	if err != nil {
+		ss.logf("notifyControl: unable to create request:", err)
+		return
+	}
+
+	resp, err := ss.conn.srv.lb.DoNoiseRequest(req)
+	if err != nil {
+		ss.logf("notifyControl: unable to send noise request:", err)
+		return
+	}
+
+	if resp.StatusCode != http.StatusCreated {
+		ss.logf("notifyControl: noise request returned status code %v", resp.StatusCode)
+		return
+	}
+}
+
 // recording is the state for an SSH session recording.
 type recording struct {
 	ss    *sshSession
 	start time.Time
+
+	// failOpen specifies whether the session should be allowed to
+	// continue if writing to the recording fails.
+	failOpen bool
 
 	mu  sync.Mutex // guards writes to, close of out
 	out io.WriteCloser
@@ -1552,7 +1453,7 @@ func (r *recording) writer(dir string, w io.Writer) io.Writer {
 		// passwords.
 		return w
 	}
-	return &loggingWriter{r, dir, w}
+	return &loggingWriter{r: r, dir: dir, w: w}
 }
 
 // loggingWriter is an io.Writer wrapper that writes first an
@@ -1561,20 +1462,30 @@ type loggingWriter struct {
 	r   *recording
 	dir string    // "i" or "o" (input or output)
 	w   io.Writer // underlying Writer, after writing to r.out
+
+	// recordingFailedOpen specifies whether we've failed to write to
+	// r.out and should stop trying. It is set to true if we fail to write
+	// to r.out and r.failOpen is set.
+	recordingFailedOpen bool
 }
 
-func (w loggingWriter) Write(p []byte) (n int, err error) {
-	j, err := json.Marshal([]interface{}{
-		time.Since(w.r.start).Seconds(),
-		w.dir,
-		string(p),
-	})
-	if err != nil {
-		return 0, err
-	}
-	j = append(j, '\n')
-	if err := w.writeCastLine(j); err != nil {
-		return 0, err
+func (w *loggingWriter) Write(p []byte) (n int, err error) {
+	if !w.recordingFailedOpen {
+		j, err := json.Marshal([]any{
+			time.Since(w.r.start).Seconds(),
+			w.dir,
+			string(p),
+		})
+		if err != nil {
+			return 0, err
+		}
+		j = append(j, '\n')
+		if err := w.writeCastLine(j); err != nil {
+			if !w.r.failOpen {
+				return 0, err
+			}
+			w.recordingFailedOpen = true
+		}
 	}
 	return w.w.Write(p)
 }
@@ -1604,6 +1515,7 @@ func envValFromList(env []string, wantKey string) (v string) {
 // envEq reports whether environment variable a == b for the current
 // operating system.
 func envEq(a, b string) bool {
+	//lint:ignore SA4032 in case this func moves elsewhere, permit the GOOS check
 	if runtime.GOOS == "windows" {
 		return strings.EqualFold(a, b)
 	}
@@ -1611,19 +1523,17 @@ func envEq(a, b string) bool {
 }
 
 var (
-	metricActiveSessions       = clientmetric.NewGauge("ssh_active_sessions")
-	metricIncomingConnections  = clientmetric.NewCounter("ssh_incoming_connections")
-	metricPublicKeyConnections = clientmetric.NewCounter("ssh_publickey_connections") // total
-	metricPublicKeyAccepts     = clientmetric.NewCounter("ssh_publickey_accepts")     // accepted subset of ssh_publickey_connections
-	metricTerminalAccept       = clientmetric.NewCounter("ssh_terminalaction_accept")
-	metricTerminalReject       = clientmetric.NewCounter("ssh_terminalaction_reject")
-	metricTerminalInterrupt    = clientmetric.NewCounter("ssh_terminalaction_interrupt")
-	metricTerminalMalformed    = clientmetric.NewCounter("ssh_terminalaction_malformed")
-	metricTerminalFetchError   = clientmetric.NewCounter("ssh_terminalaction_fetch_error")
-	metricHolds                = clientmetric.NewCounter("ssh_holds")
-	metricPolicyChangeKick     = clientmetric.NewCounter("ssh_policy_change_kick")
-	metricSFTP                 = clientmetric.NewCounter("ssh_sftp_requests")
-	metricLocalPortForward     = clientmetric.NewCounter("ssh_local_port_forward_requests")
+	metricActiveSessions      = clientmetric.NewGauge("ssh_active_sessions")
+	metricIncomingConnections = clientmetric.NewCounter("ssh_incoming_connections")
+	metricTerminalAccept      = clientmetric.NewCounter("ssh_terminalaction_accept")
+	metricTerminalReject      = clientmetric.NewCounter("ssh_terminalaction_reject")
+	metricTerminalMalformed   = clientmetric.NewCounter("ssh_terminalaction_malformed")
+	metricTerminalFetchError  = clientmetric.NewCounter("ssh_terminalaction_fetch_error")
+	metricHolds               = clientmetric.NewCounter("ssh_holds")
+	metricPolicyChangeKick    = clientmetric.NewCounter("ssh_policy_change_kick")
+	metricSFTP                = clientmetric.NewCounter("ssh_sftp_sessions")
+	metricLocalPortForward    = clientmetric.NewCounter("ssh_local_port_forward_requests")
+	metricRemotePortForward   = clientmetric.NewCounter("ssh_remote_port_forward_requests")
 )
 
 // userVisibleError is a wrapper around an error that implements
@@ -1640,4 +1550,12 @@ func (ue userVisibleError) SSHTerminationMessage() string { return ue.msg }
 type SSHTerminationError interface {
 	error
 	SSHTerminationMessage() string
+}
+
+func closeAll(cs ...io.Closer) {
+	for _, c := range cs {
+		if c != nil {
+			c.Close()
+		}
+	}
 }
