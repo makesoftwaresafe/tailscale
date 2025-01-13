@@ -8,11 +8,14 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"expvar"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode"
 	"unsafe"
 
@@ -21,20 +24,25 @@ import (
 	"github.com/tailscale/wireguard-go/tun/tuntest"
 	"go4.org/mem"
 	"go4.org/netipx"
+	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"tailscale.com/disco"
 	"tailscale.com/net/connstats"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/packet"
-	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netlogtype"
-	"tailscale.com/types/netmap"
+	"tailscale.com/types/ptr"
+	"tailscale.com/types/views"
 	"tailscale.com/util/must"
+	"tailscale.com/util/usermetric"
+	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
+	"tailscale.com/wgengine/wgcfg"
 )
 
 func udp4(src, dst string, sport, dport uint16) []byte {
@@ -151,10 +159,10 @@ func netports(netPorts ...string) (ret []filter.NetPortRange) {
 }
 
 func setfilter(logf logger.Logf, tun *Wrapper) {
-	protos := []ipproto.Proto{
+	protos := views.SliceOf([]ipproto.Proto{
 		ipproto.TCP,
 		ipproto.UDP,
-	}
+	})
 	matches := []filter.Match{
 		{IPProto: protos, Srcs: nets("5.6.7.8"), Dsts: netports("1.2.3.4:89-90")},
 		{IPProto: protos, Srcs: nets("1.2.3.4"), Dsts: netports("5.6.7.8:98")},
@@ -162,23 +170,26 @@ func setfilter(logf logger.Logf, tun *Wrapper) {
 	var sb netipx.IPSetBuilder
 	sb.AddPrefix(netip.MustParsePrefix("1.2.0.0/16"))
 	ipSet, _ := sb.IPSet()
-	tun.SetFilter(filter.New(matches, ipSet, ipSet, nil, logf))
+	tun.SetFilter(filter.New(matches, nil, ipSet, ipSet, nil, logf))
 }
 
 func newChannelTUN(logf logger.Logf, secure bool) (*tuntest.ChannelTUN, *Wrapper) {
 	chtun := tuntest.NewChannelTUN()
-	tun := Wrap(logf, chtun.TUN())
+	reg := new(usermetric.Registry)
+	tun := Wrap(logf, chtun.TUN(), reg)
 	if secure {
 		setfilter(logf, tun)
 	} else {
 		tun.disableFilter = true
 	}
+	tun.Start()
 	return chtun, tun
 }
 
 func newFakeTUN(logf logger.Logf, secure bool) (*fakeTUN, *Wrapper) {
 	ftun := NewFake()
-	tun := Wrap(logf, ftun)
+	reg := new(usermetric.Registry)
+	tun := Wrap(logf, ftun, reg)
 	if secure {
 		setfilter(logf, tun)
 	} else {
@@ -216,7 +227,7 @@ func TestReadAndInject(t *testing.T) {
 	var seen = make(map[string]bool)
 	sizes := make([]int, 1)
 	// We expect the same packets back, in no particular order.
-	for i := 0; i < len(written)+len(injected); i++ {
+	for i := range len(written) + len(injected) {
 		packet := buf[:]
 		buffs := [][]byte{packet}
 		numPackets, err := tun.Read(buffs, sizes, 0)
@@ -252,7 +263,6 @@ func TestWriteAndInject(t *testing.T) {
 	chtun, tun := newChannelTUN(t.Logf, false)
 	defer tun.Close()
 
-	const size = 2 // all payloads have this size
 	written := []string{"w0", "w1"}
 	injected := []string{"i0", "i1"}
 
@@ -278,7 +288,7 @@ func TestWriteAndInject(t *testing.T) {
 
 	seen := make(map[string]bool)
 	// We expect the same packets back, in no particular order.
-	for i := 0; i < len(written)+len(injected); i++ {
+	for i := range len(written) + len(injected) {
 		packet := <-chtun.Inbound
 		got := string(packet)
 		t.Logf("read %d: got %s", i, got)
@@ -309,8 +319,14 @@ func mustHexDecode(s string) []byte {
 }
 
 func TestFilter(t *testing.T) {
+
 	chtun, tun := newChannelTUN(t.Logf, true)
 	defer tun.Close()
+
+	// Reset the metrics before test. These are global
+	// so the different tests might have affected them.
+	tun.metrics.inboundDroppedPacketsTotal.ResetAllForTest()
+	tun.metrics.outboundDroppedPacketsTotal.ResetAllForTest()
 
 	type direction int
 
@@ -423,6 +439,28 @@ func TestFilter(t *testing.T) {
 			}
 		})
 	}
+
+	var metricInboundDroppedPacketsACL, metricInboundDroppedPacketsErr, metricOutboundDroppedPacketsACL int64
+	if m, ok := tun.metrics.inboundDroppedPacketsTotal.Get(usermetric.DropLabels{Reason: usermetric.ReasonACL}).(*expvar.Int); ok {
+		metricInboundDroppedPacketsACL = m.Value()
+	}
+	if m, ok := tun.metrics.inboundDroppedPacketsTotal.Get(usermetric.DropLabels{Reason: usermetric.ReasonError}).(*expvar.Int); ok {
+		metricInboundDroppedPacketsErr = m.Value()
+	}
+	if m, ok := tun.metrics.outboundDroppedPacketsTotal.Get(usermetric.DropLabels{Reason: usermetric.ReasonACL}).(*expvar.Int); ok {
+		metricOutboundDroppedPacketsACL = m.Value()
+	}
+
+	assertMetricPackets(t, "inACL", 3, metricInboundDroppedPacketsACL)
+	assertMetricPackets(t, "inError", 0, metricInboundDroppedPacketsErr)
+	assertMetricPackets(t, "outACL", 0, metricOutboundDroppedPacketsACL)
+}
+
+func assertMetricPackets(t *testing.T, metricName string, want, got int64) {
+	t.Helper()
+	if want != got {
+		t.Errorf("%s got unexpected value, got %d, want %d", metricName, got, want)
+	}
 }
 
 func TestAllocs(t *testing.T) {
@@ -465,7 +503,7 @@ func BenchmarkWrite(b *testing.B) {
 	defer tun.Close()
 
 	packet := [][]byte{udp4("5.6.7.8", "1.2.3.4", 89, 89)}
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, err := ftun.Write(packet, 0)
 		if err != nil {
 			b.Errorf("err = %v; want nil", err)
@@ -484,6 +522,7 @@ func TestAtomic64Alignment(t *testing.T) {
 }
 
 func TestPeerAPIBypass(t *testing.T) {
+	reg := new(usermetric.Registry)
 	wrapperWithPeerAPI := &Wrapper{
 		PeerAPIPort: func(ip netip.Addr) (port uint16, ok bool) {
 			if ip == netip.MustParseAddr("100.64.1.2") {
@@ -491,6 +530,7 @@ func TestPeerAPIBypass(t *testing.T) {
 			}
 			return
 		},
+		metrics: registerMetrics(reg),
 	}
 
 	tests := []struct {
@@ -506,13 +546,16 @@ func TestPeerAPIBypass(t *testing.T) {
 				PeerAPIPort: func(netip.Addr) (port uint16, ok bool) {
 					return 60000, true
 				},
+				metrics: registerMetrics(reg),
 			},
 			pkt:  tcp4syn("1.2.3.4", "100.64.1.2", 1234, 60000),
 			want: filter.Drop,
 		},
 		{
-			name:   "reject_with_filter",
-			w:      &Wrapper{},
+			name: "reject_with_filter",
+			w: &Wrapper{
+				metrics: registerMetrics(reg),
+			},
 			filter: filter.NewAllowNone(logger.Discard, new(netipx.IPSet)),
 			pkt:    tcp4syn("1.2.3.4", "100.64.1.2", 1234, 60000),
 			want:   filter.Drop,
@@ -546,7 +589,7 @@ func TestPeerAPIBypass(t *testing.T) {
 			tt.w.SetFilter(tt.filter)
 			tt.w.disableTSMPRejected = true
 			tt.w.logf = t.Logf
-			if got := tt.w.filterPacketInboundFromWireGuard(p); got != tt.want {
+			if got, _ := tt.w.filterPacketInboundFromWireGuard(p, nil, nil, nil); got != tt.want {
 				t.Errorf("got = %v; want %v", got, tt.want)
 			}
 		})
@@ -576,7 +619,7 @@ func TestFilterDiscoLoop(t *testing.T) {
 
 	p := new(packet.Parsed)
 	p.Decode(pkt)
-	got := tw.filterPacketInboundFromWireGuard(p)
+	got, _ := tw.filterPacketInboundFromWireGuard(p, nil, nil, nil)
 	if got != filter.DropSilently {
 		t.Errorf("got %v; want DropSilently", got)
 	}
@@ -587,7 +630,7 @@ func TestFilterDiscoLoop(t *testing.T) {
 	memLog.Reset()
 	pp := new(packet.Parsed)
 	pp.Decode(pkt)
-	got = tw.filterPacketOutboundToWireGuard(pp)
+	got, _ = tw.filterPacketOutboundToWireGuard(pp, nil, nil)
 	if got != filter.DropSilently {
 		t.Errorf("got %v; want DropSilently", got)
 	}
@@ -596,128 +639,323 @@ func TestFilterDiscoLoop(t *testing.T) {
 	}
 }
 
-func TestNATCfg(t *testing.T) {
-	node := func(ip, eip netip.Addr) *tailcfg.Node {
-		return &tailcfg.Node{
-			Addresses: []netip.Prefix{
+// TODO(andrew-d): refactor this test to no longer use addrFam, after #11945
+// removed it in peerConfigFromWGConfig
+func TestPeerCfg_NAT(t *testing.T) {
+	node := func(ip, masqIP netip.Addr, otherAllowedIPs ...netip.Prefix) wgcfg.Peer {
+		p := wgcfg.Peer{
+			PublicKey: key.NewNode().Public(),
+			AllowedIPs: []netip.Prefix{
 				netip.PrefixFrom(ip, ip.BitLen()),
 			},
-			SelfNodeV4MasqAddrForThisPeer: eip,
+		}
+		if masqIP.Is4() {
+			p.V4MasqAddr = ptr.To(masqIP)
+		} else {
+			p.V6MasqAddr = ptr.To(masqIP)
+		}
+		p.AllowedIPs = append(p.AllowedIPs, otherAllowedIPs...)
+		return p
+	}
+	test := func(addrFam ipproto.Version) {
+		var (
+			noIP netip.Addr
+
+			selfNativeIP = netip.MustParseAddr("100.64.0.1")
+			selfEIP1     = netip.MustParseAddr("100.64.1.1")
+			selfEIP2     = netip.MustParseAddr("100.64.1.2")
+			selfAddrs    = []netip.Prefix{netip.PrefixFrom(selfNativeIP, selfNativeIP.BitLen())}
+
+			peer1IP = netip.MustParseAddr("100.64.0.2")
+			peer2IP = netip.MustParseAddr("100.64.0.3")
+
+			subnet   = netip.MustParsePrefix("192.168.0.0/24")
+			subnetIP = netip.MustParseAddr("192.168.0.1")
+
+			exitRoute = netip.MustParsePrefix("0.0.0.0/0")
+			publicIP  = netip.MustParseAddr("8.8.8.8")
+		)
+		if addrFam == ipproto.Version6 {
+			selfNativeIP = netip.MustParseAddr("fd7a:115c:a1e0::a")
+			selfEIP1 = netip.MustParseAddr("fd7a:115c:a1e0::1a")
+			selfEIP2 = netip.MustParseAddr("fd7a:115c:a1e0::1b")
+			selfAddrs = []netip.Prefix{netip.PrefixFrom(selfNativeIP, selfNativeIP.BitLen())}
+
+			peer1IP = netip.MustParseAddr("fd7a:115c:a1e0::b")
+			peer2IP = netip.MustParseAddr("fd7a:115c:a1e0::c")
+
+			subnet = netip.MustParsePrefix("2001:db8::/32")
+			subnetIP = netip.MustParseAddr("2001:db8::FFFF")
+
+			exitRoute = netip.MustParsePrefix("::/0")
+			publicIP = netip.MustParseAddr("2001:4860:4860::8888")
+		}
+
+		type dnatTest struct {
+			src  netip.Addr
+			dst  netip.Addr
+			want netip.Addr // new destination after DNAT
+		}
+
+		tests := []struct {
+			name    string
+			wcfg    *wgcfg.Config
+			snatMap map[netip.Addr]netip.Addr // dst -> src
+			dnat    []dnatTest
+		}{
+			{
+				name: "no-cfg",
+				wcfg: nil,
+				snatMap: map[netip.Addr]netip.Addr{
+					peer1IP:  selfNativeIP,
+					peer2IP:  selfNativeIP,
+					subnetIP: selfNativeIP,
+				},
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfEIP1},
+					{peer2IP, selfEIP2, selfEIP2},
+				},
+			},
+			{
+				name: "single-peer-requires-nat",
+				wcfg: &wgcfg.Config{
+					Addresses: selfAddrs,
+					Peers: []wgcfg.Peer{
+						node(peer1IP, noIP),
+						node(peer2IP, selfEIP2),
+					},
+				},
+				snatMap: map[netip.Addr]netip.Addr{
+					peer1IP:  selfNativeIP,
+					peer2IP:  selfEIP2,
+					subnetIP: selfNativeIP,
+				},
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfEIP1},
+					{peer2IP, selfEIP2, selfNativeIP}, // NATed
+					{peer2IP, subnetIP, subnetIP},
+				},
+			},
+			{
+				name: "multiple-peers-require-nat",
+				wcfg: &wgcfg.Config{
+					Addresses: selfAddrs,
+					Peers: []wgcfg.Peer{
+						node(peer1IP, selfEIP1),
+						node(peer2IP, selfEIP2),
+					},
+				},
+				snatMap: map[netip.Addr]netip.Addr{
+					peer1IP:  selfEIP1,
+					peer2IP:  selfEIP2,
+					subnetIP: selfNativeIP,
+				},
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfNativeIP},
+					{peer2IP, selfEIP2, selfNativeIP},
+					{peer2IP, subnetIP, subnetIP},
+				},
+			},
+			{
+				name: "multiple-peers-require-nat-with-subnet",
+				wcfg: &wgcfg.Config{
+					Addresses: selfAddrs,
+					Peers: []wgcfg.Peer{
+						node(peer1IP, selfEIP1),
+						node(peer2IP, selfEIP2, subnet),
+					},
+				},
+				snatMap: map[netip.Addr]netip.Addr{
+					peer1IP:  selfEIP1,
+					peer2IP:  selfEIP2,
+					subnetIP: selfEIP2,
+				},
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfNativeIP},
+					{peer2IP, selfEIP2, selfNativeIP},
+					{peer2IP, subnetIP, subnetIP},
+				},
+			},
+			{
+				name: "multiple-peers-require-nat-with-default-route",
+				wcfg: &wgcfg.Config{
+					Addresses: selfAddrs,
+					Peers: []wgcfg.Peer{
+						node(peer1IP, selfEIP1),
+						node(peer2IP, selfEIP2, exitRoute),
+					},
+				},
+				snatMap: map[netip.Addr]netip.Addr{
+					peer1IP:  selfEIP1,
+					peer2IP:  selfEIP2,
+					publicIP: selfEIP2,
+				},
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfNativeIP},
+					{peer2IP, selfEIP2, selfNativeIP},
+					{peer2IP, subnetIP, subnetIP},
+				},
+			},
+			{
+				name: "no-nat",
+				wcfg: &wgcfg.Config{
+					Addresses: selfAddrs,
+					Peers: []wgcfg.Peer{
+						node(peer1IP, noIP),
+						node(peer2IP, noIP),
+					},
+				},
+				snatMap: map[netip.Addr]netip.Addr{
+					peer1IP:  selfNativeIP,
+					peer2IP:  selfNativeIP,
+					subnetIP: selfNativeIP,
+				},
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfEIP1},
+					{peer2IP, selfEIP2, selfEIP2},
+					{peer2IP, subnetIP, subnetIP},
+				},
+			},
+			{
+				name: "exit-node-require-nat-peer-doesnt",
+				wcfg: &wgcfg.Config{
+					Addresses: selfAddrs,
+					Peers: []wgcfg.Peer{
+						node(peer1IP, noIP),
+						node(peer2IP, selfEIP2, exitRoute),
+					},
+				},
+				snatMap: map[netip.Addr]netip.Addr{
+					peer1IP:  selfNativeIP,
+					peer2IP:  selfEIP2,
+					publicIP: selfEIP2,
+				},
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer2IP, selfEIP2, selfNativeIP},
+					{peer2IP, subnetIP, subnetIP},
+				},
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(fmt.Sprintf("%v/%v", addrFam, tc.name), func(t *testing.T) {
+				pcfg := peerConfigTableFromWGConfig(tc.wcfg)
+				for peer, want := range tc.snatMap {
+					if got := pcfg.selectSrcIP(selfNativeIP, peer); got != want {
+						t.Errorf("selectSrcIP[%v]: got %v; want %v", peer, got, want)
+					}
+				}
+				for i, dt := range tc.dnat {
+					if got := pcfg.mapDstIP(dt.src, dt.dst); got != dt.want {
+						t.Errorf("dnat[%d]: mapDstIP[%v, %v]: got %v; want %v", i, dt.src, dt.dst, got, dt.want)
+					}
+				}
+				if t.Failed() {
+					t.Logf("%v", pcfg)
+				}
+			})
 		}
 	}
-	var (
-		noIP netip.Addr
+	test(ipproto.Version4)
+	test(ipproto.Version6)
+}
 
-		selfNativeIP = netip.MustParseAddr("100.64.0.1")
-		selfEIP1     = netip.MustParseAddr("100.64.1.1")
-		selfEIP2     = netip.MustParseAddr("100.64.1.2")
-
-		peer1IP = netip.MustParseAddr("100.64.0.2")
-		peer2IP = netip.MustParseAddr("100.64.0.3")
-
-		// subnets should not be impacted.
-		// TODO(maisem/nyghtowl): add support for subnets and exit nodes and test them.
-		subnet = netip.MustParseAddr("192.168.0.1")
-	)
-
-	tests := []struct {
-		name    string
-		nm      *netmap.NetworkMap
-		snatMap map[netip.Addr]netip.Addr // dst -> src
-		dnatMap map[netip.Addr]netip.Addr
-	}{
-		{
-			name: "no-netmap",
-			nm:   nil,
-			snatMap: map[netip.Addr]netip.Addr{
-				peer1IP: selfNativeIP,
-				peer2IP: selfNativeIP,
-				subnet:  selfNativeIP,
-			},
-			dnatMap: map[netip.Addr]netip.Addr{
-				selfNativeIP: selfNativeIP,
-				selfEIP1:     selfEIP1,
-				selfEIP2:     selfEIP2,
-			},
-		},
-		{
-			name: "single-peer-requires-nat",
-			nm: &netmap.NetworkMap{
-				SelfNode: node(selfNativeIP, noIP),
-				Peers: []*tailcfg.Node{
-					node(peer1IP, noIP),
-					node(peer2IP, selfEIP1),
-				},
-			},
-			snatMap: map[netip.Addr]netip.Addr{
-				peer1IP: selfNativeIP,
-				peer2IP: selfEIP1,
-				subnet:  selfNativeIP,
-			},
-			dnatMap: map[netip.Addr]netip.Addr{
-				selfNativeIP: selfNativeIP,
-				selfEIP1:     selfNativeIP,
-				selfEIP2:     selfEIP2,
-				subnet:       subnet,
-			},
-		},
-		{
-			name: "multiple-peers-require-nat",
-			nm: &netmap.NetworkMap{
-				SelfNode: node(selfNativeIP, noIP),
-				Peers: []*tailcfg.Node{
-					node(peer1IP, selfEIP1),
-					node(peer2IP, selfEIP2),
-				},
-			},
-			snatMap: map[netip.Addr]netip.Addr{
-				peer1IP: selfEIP1,
-				peer2IP: selfEIP2,
-				subnet:  selfNativeIP,
-			},
-			dnatMap: map[netip.Addr]netip.Addr{
-				selfNativeIP: selfNativeIP,
-				selfEIP1:     selfNativeIP,
-				selfEIP2:     selfNativeIP,
-				subnet:       subnet,
-			},
-		},
-		{
-			name: "no-nat",
-			nm: &netmap.NetworkMap{
-				SelfNode: node(selfNativeIP, noIP),
-				Peers: []*tailcfg.Node{
-					node(peer1IP, noIP),
-					node(peer2IP, noIP),
-				},
-			},
-			snatMap: map[netip.Addr]netip.Addr{
-				peer1IP: selfNativeIP,
-				peer2IP: selfNativeIP,
-				subnet:  selfNativeIP,
-			},
-			dnatMap: map[netip.Addr]netip.Addr{
-				selfNativeIP: selfNativeIP,
-				selfEIP1:     selfEIP1,
-				selfEIP2:     selfEIP2,
-				subnet:       subnet,
-			},
-		},
+// TestCaptureHook verifies that the Wrapper.captureHook callback is called
+// with the correct parameters when various packet operations are performed.
+func TestCaptureHook(t *testing.T) {
+	type captureRecord struct {
+		path capture.Path
+		now  time.Time
+		pkt  []byte
+		meta packet.CaptureMeta
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			ncfg := natConfigFromNetMap(tc.nm)
-			for peer, want := range tc.snatMap {
-				if got := ncfg.selectSrcIP(selfNativeIP, peer); got != want {
-					t.Errorf("selectSrcIP: got %v; want %v", got, want)
-				}
-			}
-			for dstIP, want := range tc.dnatMap {
-				if got := ncfg.mapDstIP(dstIP); got != want {
-					t.Errorf("mapDstIP: got %v; want %v", got, want)
-				}
-			}
+	var captured []captureRecord
+	hook := func(path capture.Path, now time.Time, pkt []byte, meta packet.CaptureMeta) {
+		captured = append(captured, captureRecord{
+			path: path,
+			now:  now,
+			pkt:  pkt,
+			meta: meta,
 		})
+	}
+
+	now := time.Unix(1682085856, 0)
+
+	_, w := newFakeTUN(t.Logf, true)
+	w.timeNow = func() time.Time {
+		return now
+	}
+	w.InstallCaptureHook(hook)
+	defer w.Close()
+
+	// Loop reading and discarding packets; this ensures that we don't have
+	// packets stuck in vectorOutbound
+	go func() {
+		var (
+			buf   [MaxPacketSize]byte
+			sizes = make([]int, 1)
+		)
+		for {
+			_, err := w.Read([][]byte{buf[:]}, sizes, 0)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Do operations that should result in a packet being captured.
+	w.Write([][]byte{
+		[]byte("Write1"),
+		[]byte("Write2"),
+	}, 0)
+	packetBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData([]byte("InjectInboundPacketBuffer")),
+	})
+	buffs := make([][]byte, 1)
+	buffs[0] = make([]byte, PacketStartOffset+packetBuf.Size())
+	sizes := make([]int, 1)
+	w.InjectInboundPacketBuffer(packetBuf, buffs, sizes)
+
+	packetBuf = stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData([]byte("InjectOutboundPacketBuffer")),
+	})
+	w.InjectOutboundPacketBuffer(packetBuf)
+
+	// TODO: test Read
+	// TODO: determine if we want InjectOutbound to log
+
+	// Assert that the right packets are captured.
+	want := []captureRecord{
+		{
+			path: capture.FromPeer,
+			pkt:  []byte("Write1"),
+		},
+		{
+			path: capture.FromPeer,
+			pkt:  []byte("Write2"),
+		},
+		{
+			path: capture.SynthesizedToLocal,
+			pkt:  []byte("InjectInboundPacketBuffer"),
+		},
+		{
+			path: capture.SynthesizedToPeer,
+			pkt:  []byte("InjectOutboundPacketBuffer"),
+		},
+	}
+	for i := range len(want) {
+		want[i].now = now
+	}
+	if !reflect.DeepEqual(captured, want) {
+		t.Errorf("mismatch between captured and expected packets\ngot: %+v\nwant: %+v",
+			captured, want)
 	}
 }

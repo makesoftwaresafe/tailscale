@@ -22,14 +22,15 @@ import (
 	"time"
 
 	miekdns "github.com/miekg/dns"
-	"golang.org/x/net/dns/dnsmessage"
 	dns "golang.org/x/net/dns/dnsmessage"
+	"tailscale.com/health"
 	"tailscale.com/net/netaddr"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
+	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/wgengine/monitor"
 )
 
 var (
@@ -38,8 +39,6 @@ var (
 
 	testipv4Arpa = dnsname.FQDN("4.3.2.1.in-addr.arpa.")
 	testipv6Arpa = dnsname.FQDN("f.0.e.0.d.0.c.0.b.0.a.0.9.0.8.0.7.0.6.0.5.0.4.0.3.0.2.0.1.0.0.0.ip6.arpa.")
-
-	magicDNSv4Port = netip.MustParseAddrPort("100.100.100.100:53")
 )
 
 var dnsCfg = Config{
@@ -234,7 +233,7 @@ func unpackResponse(payload []byte) (dnsResponse, error) {
 }
 
 func syncRespond(r *Resolver, query []byte) ([]byte, error) {
-	return r.Query(context.Background(), query, netip.AddrPort{})
+	return r.Query(context.Background(), query, "udp", netip.AddrPort{})
 }
 
 func mustIP(str string) netip.Addr {
@@ -243,6 +242,43 @@ func mustIP(str string) netip.Addr {
 		panic(err)
 	}
 	return ip
+}
+
+func TestRoutesRequireNoCustomResolvers(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   Config
+		expected bool
+	}{
+		{"noRoutes", Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{}}, true},
+		{"onlyDefault", Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{
+			"ts.net.": {
+				{},
+			},
+		}}, true},
+		{"oneOther", Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{
+			"example.com.": {
+				{},
+			},
+		}}, false},
+		{"defaultAndOneOther", Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{
+			"ts.net.": {
+				{},
+			},
+			"example.com.": {
+				{},
+			},
+		}}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.config.RoutesRequireNoCustomResolvers()
+			if result != tt.expected {
+				t.Errorf("result = %v; want %v", result, tt.expected)
+			}
+		})
+	}
 }
 
 func TestRDNSNameToIPv4(t *testing.T) {
@@ -316,7 +352,12 @@ func TestRDNSNameToIPv6(t *testing.T) {
 }
 
 func newResolver(t testing.TB) *Resolver {
-	return New(t.Logf, nil /* no link monitor */, nil /* no link selector */, new(tsdial.Dialer))
+	return New(t.Logf,
+		nil, // no link selector
+		tsdial.NewDialer(netmon.NewStatic()),
+		new(health.Tracker),
+		nil, // no control knobs
+	)
 }
 
 func TestResolveLocal(t *testing.T) {
@@ -362,6 +403,12 @@ func TestResolveLocal(t *testing.T) {
 		// suffixes are currently hard-coded and not plumbed via the netmap)
 		{"via_form3_dec_example.com", dnsname.FQDN("1-2-3-4-via-1.example.com."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
 		{"via_form3_dec_examplets.net", dnsname.FQDN("1-2-3-4-via-1.examplets.net."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
+
+		// Resolve A and ALL types of resource records.
+		{"via_type_a", dnsname.FQDN("1-2-3-4-via-1."), dns.TypeA, netip.Addr{}, dns.RCodeSuccess},
+		{"via_invalid_type_a", dnsname.FQDN("1-2-3-4-via-."), dns.TypeA, netip.Addr{}, dns.RCodeRefused},
+		{"via_type_all", dnsname.FQDN("1-2-3-4-via-1."), dns.TypeALL, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:1.2.3.4"), dns.RCodeSuccess},
+		{"via_invalid_type_all", dnsname.FQDN("1-2-3-4-via-."), dns.TypeALL, netip.Addr{}, dns.RCodeRefused},
 	}
 
 	for _, tt := range tests {
@@ -979,7 +1026,7 @@ func BenchmarkFull(b *testing.B) {
 	for _, tt := range tests {
 		b.Run(tt.name, func(b *testing.B) {
 			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
+			for range b.N {
 				syncRespond(r, tt.request)
 			}
 		})
@@ -998,7 +1045,7 @@ func TestMarshalResponseFormatError(t *testing.T) {
 
 func TestForwardLinkSelection(t *testing.T) {
 	configCall := make(chan string, 1)
-	tstest.Replace(t, &initListenConfig, func(nc *net.ListenConfig, mon *monitor.Mon, tunName string) error {
+	tstest.Replace(t, &initListenConfig, func(nc *net.ListenConfig, netMon *netmon.Monitor, tunName string) error {
 		select {
 		case configCall <- tunName:
 			return nil
@@ -1012,12 +1059,18 @@ func TestForwardLinkSelection(t *testing.T) {
 	// routes differently.
 	specialIP := netaddr.IPv4(1, 2, 3, 4)
 
-	fwd := newForwarder(t.Logf, nil, linkSelFunc(func(ip netip.Addr) string {
+	netMon, err := netmon.New(logger.WithPrefix(t.Logf, ".... netmon: "))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { netMon.Close() })
+
+	fwd := newForwarder(t.Logf, netMon, linkSelFunc(func(ip netip.Addr) string {
 		if ip == netaddr.IPv4(1, 2, 3, 4) {
 			return "special"
 		}
 		return ""
-	}), new(tsdial.Dialer))
+	}), new(tsdial.Dialer), new(health.Tracker), nil /* no control knobs */)
 
 	// Test non-special IP.
 	if got, err := fwd.packetListener(netip.Addr{}); err != nil {
@@ -1121,15 +1174,15 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 
 	t.Run("no_such_host", func(t *testing.T) {
 		res, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), t.Logf, backResolver, &response{
-			Header: dnsmessage.Header{
+			Header: dns.Header{
 				ID:       123,
 				Response: true,
 				OpCode:   0, // query
 			},
-			Question: dnsmessage.Question{
-				Name:  dnsmessage.MustNewName("nx-domain.test."),
-				Type:  dnsmessage.TypeA,
-				Class: dnsmessage.ClassINET,
+			Question: dns.Question{
+				Name:  dns.MustNewName("nx-domain.test."),
+				Type:  dns.TypeA,
+				Class: dns.ClassINET,
 			},
 		})
 		if err != nil {
@@ -1156,74 +1209,74 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 	}
 
 	tests := []struct {
-		Type  dnsmessage.Type
+		Type  dns.Type
 		Name  string
 		Check func(t testing.TB, got []byte)
 	}{
 		{
-			Type:  dnsmessage.TypeA,
+			Type:  dns.TypeA,
 			Name:  "one-a.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\x05one-a\x04test\x00\x00\x01\x00\x01\x05one-a\x04test\x00\x00\x01\x00\x01\x00\x00\x02X\x00\x04\x01\x02\x03\x04"),
 		},
 		{
-			Type:  dnsmessage.TypeA,
+			Type:  dns.TypeA,
 			Name:  "two-a.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\x05two-a\x04test\x00\x00\x01\x00\x01\xc0\f\x00\x01\x00\x01\x00\x00\x02X\x00\x04\x01\x02\x03\x04\xc0\f\x00\x01\x00\x01\x00\x00\x02X\x00\x04\x05\x06\a\b"),
 		},
 		{
-			Type:  dnsmessage.TypeAAAA,
+			Type:  dns.TypeAAAA,
 			Name:  "one-aaaa.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\bone-aaaa\x04test\x00\x00\x1c\x00\x01\bone-aaaa\x04test\x00\x00\x1c\x00\x01\x00\x00\x02X\x00\x10\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"),
 		},
 		{
-			Type:  dnsmessage.TypeAAAA,
+			Type:  dns.TypeAAAA,
 			Name:  "two-aaaa.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\btwo-aaaa\x04test\x00\x00\x1c\x00\x01\xc0\f\x00\x1c\x00\x01\x00\x00\x02X\x00\x10\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\xc0\f\x00\x1c\x00\x01\x00\x00\x02X\x00\x10\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x04"),
 		},
 		{
-			Type:  dnsmessage.TypePTR,
+			Type:  dns.TypePTR,
 			Name:  "4.3.2.1.in-addr.arpa.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\x014\x013\x012\x011\ain-addr\x04arpa\x00\x00\f\x00\x01\x014\x013\x012\x011\ain-addr\x04arpa\x00\x00\f\x00\x01\x00\x00\x02X\x00\t\x03foo\x03com\x00"),
 		},
 		{
-			Type:  dnsmessage.TypeCNAME,
+			Type:  dns.TypeCNAME,
 			Name:  "cname.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\x05cname\x04test\x00\x00\x05\x00\x01\x05cname\x04test\x00\x00\x05\x00\x01\x00\x00\x02X\x00\x10\nthe-target\x03foo\x00"),
 		},
 
 		// No records of various types
 		{
-			Type:  dnsmessage.TypeA,
+			Type:  dns.TypeA,
 			Name:  "no-records.test.",
 			Check: matchPacked("\x00{\x84\x03\x00\x01\x00\x00\x00\x00\x00\x00\nno-records\x04test\x00\x00\x01\x00\x01"),
 		},
 		{
-			Type:  dnsmessage.TypeAAAA,
+			Type:  dns.TypeAAAA,
 			Name:  "no-records.test.",
 			Check: matchPacked("\x00{\x84\x03\x00\x01\x00\x00\x00\x00\x00\x00\nno-records\x04test\x00\x00\x1c\x00\x01"),
 		},
 		{
-			Type:  dnsmessage.TypeCNAME,
+			Type:  dns.TypeCNAME,
 			Name:  "no-records.test.",
 			Check: matchPacked("\x00{\x84\x03\x00\x01\x00\x00\x00\x00\x00\x00\nno-records\x04test\x00\x00\x05\x00\x01"),
 		},
 		{
-			Type:  dnsmessage.TypeSRV,
+			Type:  dns.TypeSRV,
 			Name:  "no-records.test.",
 			Check: matchPacked("\x00{\x84\x03\x00\x01\x00\x00\x00\x00\x00\x00\nno-records\x04test\x00\x00!\x00\x01"),
 		},
 		{
-			Type:  dnsmessage.TypeTXT,
+			Type:  dns.TypeTXT,
 			Name:  "txt.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x03\x00\x00\x00\x00\x03txt\x04test\x00\x00\x10\x00\x01\x03txt\x04test\x00\x00\x10\x00\x01\x00\x00\x02X\x00\t\btxt1=one\x03txt\x04test\x00\x00\x10\x00\x01\x00\x00\x02X\x00\t\btxt2=two\x03txt\x04test\x00\x00\x10\x00\x01\x00\x00\x02X\x00\v\ntxt3=three"),
 		},
 		{
-			Type:  dnsmessage.TypeSRV,
+			Type:  dns.TypeSRV,
 			Name:  "srv.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\x03srv\x04test\x00\x00!\x00\x01\x03srv\x04test\x00\x00!\x00\x01\x00\x00\x02X\x00\x0f\x00\x01\x00\x02\x00\x03\x03foo\x03com\x00\x03srv\x04test\x00\x00!\x00\x01\x00\x00\x02X\x00\x0f\x00\x04\x00\x05\x00\x06\x03bar\x03com\x00"),
 		},
 		{
-			Type:  dnsmessage.TypeNS,
+			Type:  dns.TypeNS,
 			Name:  "ns.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\x02ns\x04test\x00\x00\x02\x00\x01\x02ns\x04test\x00\x00\x02\x00\x01\x00\x00\x02X\x00\t\x03ns1\x03foo\x00\x02ns\x04test\x00\x00\x02\x00\x01\x00\x00\x02X\x00\t\x03ns2\x03bar\x00"),
 		},
@@ -1232,15 +1285,15 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("%v_%v", tt.Type, strings.Trim(tt.Name, ".")), func(t *testing.T) {
 			got, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), t.Logf, backResolver, &response{
-				Header: dnsmessage.Header{
+				Header: dns.Header{
 					ID:       123,
 					Response: true,
 					OpCode:   0, // query
 				},
-				Question: dnsmessage.Question{
-					Name:  dnsmessage.MustNewName(tt.Name),
+				Question: dns.Question{
+					Name:  dns.MustNewName(tt.Name),
 					Type:  tt.Type,
-					Class: dnsmessage.ClassINET,
+					Class: dns.ClassINET,
 				},
 			})
 			if err != nil {
@@ -1450,8 +1503,8 @@ func TestServfail(t *testing.T) {
 	r.SetConfig(cfg)
 
 	pkt, err := syncRespond(r, dnspacket("test.site.", dns.TypeA, noEdns))
-	if err != errServerFailure {
-		t.Errorf("err = %v, want %v", err, errServerFailure)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
 	}
 
 	wantPkt := []byte{

@@ -1,38 +1,29 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-// No need to run this on Windows where CI's slow enough. Then we don't need to
-// worry about "go.exe" etc.
-
-//go:build !windows
-
 package iosdeps
 
 import (
-	"encoding/json"
-	"os"
-	"os/exec"
 	"testing"
+
+	"tailscale.com/tstest/deptest"
 )
 
 func TestDeps(t *testing.T) {
-	cmd := exec.Command("go", "list", "-json", ".")
-	cmd.Env = append(os.Environ(), "GOOS=ios", "GOARCH=arm64")
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var res struct {
-		Deps []string
-	}
-	if err := json.Unmarshal(out, &res); err != nil {
-		t.Fatal(err)
-	}
-	for _, dep := range res.Deps {
-		switch dep {
-		case "text/template", "html/template":
-			t.Errorf("package %q is not allowed as a dependency on iOS", dep)
-		}
-	}
-	t.Logf("got %d dependencies", len(res.Deps))
+	deptest.DepChecker{
+		GOOS:   "ios",
+		GOARCH: "arm64",
+		BadDeps: map[string]string{
+			"testing":                             "do not use testing package in production code",
+			"text/template":                       "linker bloat (MethodByName)",
+			"html/template":                       "linker bloat (MethodByName)",
+			"tailscale.com/net/wsconn":            "https://github.com/tailscale/tailscale/issues/13762",
+			"github.com/coder/websocket":          "https://github.com/tailscale/tailscale/issues/13762",
+			"github.com/mitchellh/go-ps":          "https://github.com/tailscale/tailscale/pull/13759",
+			"database/sql/driver":                 "iOS doesn't use an SQL database",
+			"github.com/google/uuid":              "see tailscale/tailscale#13760",
+			"tailscale.com/clientupdate/distsign": "downloads via AppStore, not distsign",
+			"github.com/tailscale/hujson":         "no config file support on iOS",
+		},
+	}.Check(t)
 }

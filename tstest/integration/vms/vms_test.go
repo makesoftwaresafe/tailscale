@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !windows
+//go:build !windows && !plan9
 
 package vms
 
@@ -321,7 +321,7 @@ func (h *Harness) setupSSHShell(t *testing.T, d Distro, ipm ipMapping) (*ssh.Cli
 	// don't use socket activation.
 	const maxRetries = 5
 	var working bool
-	for i := 0; i < maxRetries; i++ {
+	for range maxRetries {
 		cli, err := ssh.Dial("tcp", hostport, ccfg)
 		if err == nil {
 			working = true

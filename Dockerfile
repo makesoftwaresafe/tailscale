@@ -1,17 +1,13 @@
 # Copyright (c) Tailscale Inc & AUTHORS
 # SPDX-License-Identifier: BSD-3-Clause
 
-############################################################################
+# Note that this Dockerfile is currently NOT used to build any of the published
+# Tailscale container images and may have drifted from the image build mechanism
+# we use.
+# Tailscale images are currently built using https://github.com/tailscale/mkctr,
+# and the build script can be found in ./build_docker.sh.
 #
-# WARNING: Tailscale is not yet officially supported in container
-# environments, such as Docker and Kubernetes. Though it should work, we
-# don't regularly test it, and we know there are some feature limitations.
 #
-# See current bugs tagged "containers":
-#    https://github.com/tailscale/tailscale/labels/containers
-#
-############################################################################
-
 # This Dockerfile includes all the tailscale binaries.
 #
 # To build the Dockerfile:
@@ -31,7 +27,7 @@
 #     $ docker exec tailscaled tailscale status
 
 
-FROM golang:1.20-alpine AS build-env
+FROM golang:1.23-alpine AS build-env
 
 WORKDIR /go/src/tailscale
 
@@ -46,9 +42,8 @@ RUN go install \
     gvisor.dev/gvisor/pkg/tcpip/stack \
     golang.org/x/crypto/ssh \
     golang.org/x/crypto/acme \
-    nhooyr.io/websocket \
-    github.com/mdlayher/netlink \
-    golang.zx2c4.com/wireguard/device
+    github.com/coder/websocket \
+    github.com/mdlayher/netlink
 
 COPY . .
 
@@ -67,10 +62,10 @@ RUN GOARCH=$TARGETARCH go install -ldflags="\
       -X tailscale.com/version.gitCommitStamp=$VERSION_GIT_HASH" \
       -v ./cmd/tailscale ./cmd/tailscaled ./cmd/containerboot
 
-FROM alpine:3.16
+FROM alpine:3.21
 RUN apk add --no-cache ca-certificates iptables iproute2 ip6tables
 
 COPY --from=build-env /go/bin/* /usr/local/bin/
 # For compat with the previous run.sh, although ideally you should be
 # using build_docker.sh which sets an entrypoint for the image.
-RUN ln -s /usr/local/bin/containerboot /tailscale/run.sh
+RUN mkdir /tailscale && ln -s /usr/local/bin/containerboot /tailscale/run.sh

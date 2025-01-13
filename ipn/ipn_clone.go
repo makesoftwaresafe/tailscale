@@ -6,11 +6,15 @@
 package ipn
 
 import (
+	"maps"
 	"net/netip"
 
+	"tailscale.com/drive"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/opt"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
+	"tailscale.com/types/ptr"
 )
 
 // Clone makes a deep copy of Prefs.
@@ -23,6 +27,17 @@ func (src *Prefs) Clone() *Prefs {
 	*dst = *src
 	dst.AdvertiseTags = append(src.AdvertiseTags[:0:0], src.AdvertiseTags...)
 	dst.AdvertiseRoutes = append(src.AdvertiseRoutes[:0:0], src.AdvertiseRoutes...)
+	dst.AdvertiseServices = append(src.AdvertiseServices[:0:0], src.AdvertiseServices...)
+	if src.DriveShares != nil {
+		dst.DriveShares = make([]*drive.Share, len(src.DriveShares))
+		for i := range dst.DriveShares {
+			if src.DriveShares[i] == nil {
+				dst.DriveShares[i] = nil
+			} else {
+				dst.DriveShares[i] = src.DriveShares[i].Clone()
+			}
+		}
+	}
 	dst.Persist = src.Persist.Clone()
 	return dst
 }
@@ -31,12 +46,13 @@ func (src *Prefs) Clone() *Prefs {
 var _PrefsCloneNeedsRegeneration = Prefs(struct {
 	ControlURL             string
 	RouteAll               bool
-	AllowSingleHosts       bool
 	ExitNodeID             tailcfg.StableNodeID
 	ExitNodeIP             netip.Addr
+	InternalExitNodePrior  tailcfg.StableNodeID
 	ExitNodeAllowLANAccess bool
 	CorpDNS                bool
 	RunSSH                 bool
+	RunWebClient           bool
 	WantRunning            bool
 	LoggedOut              bool
 	ShieldsUp              bool
@@ -46,10 +62,18 @@ var _PrefsCloneNeedsRegeneration = Prefs(struct {
 	ForceDaemon            bool
 	Egg                    bool
 	AdvertiseRoutes        []netip.Prefix
+	AdvertiseServices      []string
 	NoSNAT                 bool
+	NoStatefulFiltering    opt.Bool
 	NetfilterMode          preftype.NetfilterMode
 	OperatorUser           string
 	ProfileName            string
+	AutoUpdate             AutoUpdatePrefs
+	AppConnector           AppConnectorPrefs
+	PostureChecking        bool
+	NetfilterKind          string
+	DriveShares            []*drive.Share
+	AllowSingleHosts       marshalAsTrueInJSON
 	Persist                *persist.Persist
 }{})
 
@@ -64,19 +88,42 @@ func (src *ServeConfig) Clone() *ServeConfig {
 	if dst.TCP != nil {
 		dst.TCP = map[uint16]*TCPPortHandler{}
 		for k, v := range src.TCP {
-			dst.TCP[k] = v.Clone()
+			if v == nil {
+				dst.TCP[k] = nil
+			} else {
+				dst.TCP[k] = ptr.To(*v)
+			}
 		}
 	}
 	if dst.Web != nil {
 		dst.Web = map[HostPort]*WebServerConfig{}
 		for k, v := range src.Web {
-			dst.Web[k] = v.Clone()
+			if v == nil {
+				dst.Web[k] = nil
+			} else {
+				dst.Web[k] = v.Clone()
+			}
 		}
 	}
-	if dst.AllowFunnel != nil {
-		dst.AllowFunnel = map[HostPort]bool{}
-		for k, v := range src.AllowFunnel {
-			dst.AllowFunnel[k] = v
+	if dst.Services != nil {
+		dst.Services = map[string]*ServiceConfig{}
+		for k, v := range src.Services {
+			if v == nil {
+				dst.Services[k] = nil
+			} else {
+				dst.Services[k] = v.Clone()
+			}
+		}
+	}
+	dst.AllowFunnel = maps.Clone(src.AllowFunnel)
+	if dst.Foreground != nil {
+		dst.Foreground = map[string]*ServeConfig{}
+		for k, v := range src.Foreground {
+			if v == nil {
+				dst.Foreground[k] = nil
+			} else {
+				dst.Foreground[k] = v.Clone()
+			}
 		}
 	}
 	return dst
@@ -86,7 +133,48 @@ func (src *ServeConfig) Clone() *ServeConfig {
 var _ServeConfigCloneNeedsRegeneration = ServeConfig(struct {
 	TCP         map[uint16]*TCPPortHandler
 	Web         map[HostPort]*WebServerConfig
+	Services    map[string]*ServiceConfig
 	AllowFunnel map[HostPort]bool
+	Foreground  map[string]*ServeConfig
+	ETag        string
+}{})
+
+// Clone makes a deep copy of ServiceConfig.
+// The result aliases no memory with the original.
+func (src *ServiceConfig) Clone() *ServiceConfig {
+	if src == nil {
+		return nil
+	}
+	dst := new(ServiceConfig)
+	*dst = *src
+	if dst.TCP != nil {
+		dst.TCP = map[uint16]*TCPPortHandler{}
+		for k, v := range src.TCP {
+			if v == nil {
+				dst.TCP[k] = nil
+			} else {
+				dst.TCP[k] = ptr.To(*v)
+			}
+		}
+	}
+	if dst.Web != nil {
+		dst.Web = map[HostPort]*WebServerConfig{}
+		for k, v := range src.Web {
+			if v == nil {
+				dst.Web[k] = nil
+			} else {
+				dst.Web[k] = v.Clone()
+			}
+		}
+	}
+	return dst
+}
+
+// A compilation failure here means this code must be regenerated, with the command at the top of this file.
+var _ServiceConfigCloneNeedsRegeneration = ServiceConfig(struct {
+	TCP map[uint16]*TCPPortHandler
+	Web map[HostPort]*WebServerConfig
+	Tun bool
 }{})
 
 // Clone makes a deep copy of TCPPortHandler.
@@ -103,6 +191,7 @@ func (src *TCPPortHandler) Clone() *TCPPortHandler {
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _TCPPortHandlerCloneNeedsRegeneration = TCPPortHandler(struct {
 	HTTPS        bool
+	HTTP         bool
 	TCPForward   string
 	TerminateTLS string
 }{})
@@ -136,7 +225,11 @@ func (src *WebServerConfig) Clone() *WebServerConfig {
 	if dst.Handlers != nil {
 		dst.Handlers = map[string]*HTTPHandler{}
 		for k, v := range src.Handlers {
-			dst.Handlers[k] = v.Clone()
+			if v == nil {
+				dst.Handlers[k] = nil
+			} else {
+				dst.Handlers[k] = ptr.To(*v)
+			}
 		}
 	}
 	return dst

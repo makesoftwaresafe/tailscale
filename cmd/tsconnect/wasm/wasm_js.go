@@ -16,7 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/netip"
@@ -35,8 +35,9 @@ import (
 	"tailscale.com/net/netns"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/safesocket"
-	"tailscale.com/smallzstd"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tsd"
+	"tailscale.com/types/views"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/netstack"
 	"tailscale.com/words"
@@ -46,7 +47,7 @@ import (
 var ControlURL = ipn.DefaultControlURL
 
 func main() {
-	js.Global().Set("newIPN", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+	js.Global().Set("newIPN", js.FuncOf(func(this js.Value, args []js.Value) any {
 		if len(args) != 1 {
 			log.Fatal("Usage: newIPN(config)")
 			return nil
@@ -89,29 +90,36 @@ func newIPN(jsConfig js.Value) map[string]any {
 	c := logtail.Config{
 		Collection: lpc.Collection,
 		PrivateID:  lpc.PrivateID,
-		// NewZstdEncoder is intentionally not passed in, compressed requests
-		// set HTTP headers that are not supported by the no-cors fetching mode.
+
+		// Compressed requests set HTTP headers that are not supported by the
+		// no-cors fetching mode:
+		CompressLogs: false,
+
 		HTTPC: &http.Client{Transport: &noCORSTransport{http.DefaultTransport}},
 	}
 	logtail := logtail.NewLogger(c, log.Printf)
 	logf := logtail.Logf
 
+	sys := new(tsd.System)
+	sys.Set(store)
 	dialer := &tsdial.Dialer{Logf: logf}
 	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
-		Dialer: dialer,
+		Dialer:        dialer,
+		SetSubsystem:  sys.Set,
+		ControlKnobs:  sys.ControlKnobs(),
+		HealthTracker: sys.HealthTracker(),
+		Metrics:       sys.UserMetricsRegistry(),
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
+	sys.Set(eng)
 
-	tunDev, magicConn, dnsManager, ok := eng.(wgengine.InternalsGetter).GetInternals()
-	if !ok {
-		log.Fatalf("%T is not a wgengine.InternalsGetter", eng)
-	}
-	ns, err := netstack.Create(logf, tunDev, eng, magicConn, dialer, dnsManager)
+	ns, err := netstack.Create(logf, sys.Tun.Get(), eng, sys.MagicSock.Get(), dialer, sys.DNSManager.Get(), sys.ProxyMapper())
 	if err != nil {
 		log.Fatalf("netstack.Create: %v", err)
 	}
+	sys.Set(ns)
 	ns.ProcessLocalIPs = true
 	ns.ProcessSubnets = true
 
@@ -121,19 +129,21 @@ func newIPN(jsConfig js.Value) map[string]any {
 	dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
 		return ns.DialContextTCP(ctx, dst)
 	}
+	dialer.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+		return ns.DialContextUDP(ctx, dst)
+	}
+	sys.NetstackRouter.Set(true)
+	sys.Tun.Get().Start()
 
 	logid := lpc.PublicID
-	srv := ipnserver.New(logf, logid)
-	lb, err := ipnlocal.NewLocalBackend(logf, logid, store, dialer, eng, controlclient.LoginEphemeral)
+	srv := ipnserver.New(logf, logid, sys.NetMon.Get())
+	lb, err := ipnlocal.NewLocalBackend(logf, logid, sys, controlclient.LoginEphemeral)
 	if err != nil {
 		log.Fatalf("ipnlocal.NewLocalBackend: %v", err)
 	}
 	if err := ns.Start(lb); err != nil {
 		log.Fatalf("failed to start netstack: %v", err)
 	}
-	lb.SetDecompressor(func() (controlclient.Decompressor, error) {
-		return smallzstd.NewDecoder(nil)
-	})
 	srv.SetLocalBackend(lb)
 
 	jsIPN := &jsIPN{
@@ -146,7 +156,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 	}
 
 	return map[string]any{
-		"run": js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		"run": js.FuncOf(func(this js.Value, args []js.Value) any {
 			if len(args) != 1 {
 				log.Fatal(`Usage: run({
 					notifyState(state: int): void,
@@ -159,7 +169,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 			jsIPN.run(args[0])
 			return nil
 		}),
-		"login": js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		"login": js.FuncOf(func(this js.Value, args []js.Value) any {
 			if len(args) != 0 {
 				log.Printf("Usage: login()")
 				return nil
@@ -167,7 +177,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 			jsIPN.login()
 			return nil
 		}),
-		"logout": js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		"logout": js.FuncOf(func(this js.Value, args []js.Value) any {
 			if len(args) != 0 {
 				log.Printf("Usage: logout()")
 				return nil
@@ -175,7 +185,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 			jsIPN.logout()
 			return nil
 		}),
-		"ssh": js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		"ssh": js.FuncOf(func(this js.Value, args []js.Value) any {
 			if len(args) != 3 {
 				log.Printf("Usage: ssh(hostname, userName, termConfig)")
 				return nil
@@ -185,7 +195,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 				args[1].String(),
 				args[2])
 		}),
-		"fetch": js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		"fetch": js.FuncOf(func(this js.Value, args []js.Value) any {
 			if len(args) != 1 {
 				log.Printf("Usage: fetch(url)")
 				return nil
@@ -249,30 +259,34 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 				Self: jsNetMapSelfNode{
 					jsNetMapNode: jsNetMapNode{
 						Name:       nm.Name,
-						Addresses:  mapSlice(nm.Addresses, func(a netip.Prefix) string { return a.Addr().String() }),
+						Addresses:  mapSliceView(nm.GetAddresses(), func(a netip.Prefix) string { return a.Addr().String() }),
 						NodeKey:    nm.NodeKey.String(),
 						MachineKey: nm.MachineKey.String(),
 					},
-					MachineStatus: jsMachineStatus[nm.MachineStatus],
+					MachineStatus: jsMachineStatus[nm.GetMachineStatus()],
 				},
-				Peers: mapSlice(nm.Peers, func(p *tailcfg.Node) jsNetMapPeerNode {
-					name := p.Name
+				Peers: mapSlice(nm.Peers, func(p tailcfg.NodeView) jsNetMapPeerNode {
+					name := p.Name()
 					if name == "" {
 						// In practice this should only happen for Hello.
-						name = p.Hostinfo.Hostname()
+						name = p.Hostinfo().Hostname()
+					}
+					addrs := make([]string, p.Addresses().Len())
+					for i, ap := range p.Addresses().All() {
+						addrs[i] = ap.Addr().String()
 					}
 					return jsNetMapPeerNode{
 						jsNetMapNode: jsNetMapNode{
 							Name:       name,
-							Addresses:  mapSlice(p.Addresses, func(a netip.Prefix) string { return a.Addr().String() }),
-							MachineKey: p.Machine.String(),
-							NodeKey:    p.Key.String(),
+							Addresses:  addrs,
+							MachineKey: p.Machine().String(),
+							NodeKey:    p.Key().String(),
 						},
-						Online:              p.Online,
-						TailscaleSSHEnabled: p.Hostinfo.TailscaleSSHEnabled(),
+						Online:              p.Online(),
+						TailscaleSSHEnabled: p.Hostinfo().TailscaleSSHEnabled(),
 					}
 				}),
-				LockedOut: nm.TKAEnabled && len(nm.SelfNode.KeySignature) == 0,
+				LockedOut: nm.TKAEnabled && nm.SelfNode.KeySignature().Len() == 0,
 			}
 			if jsonNetMap, err := json.Marshal(jsNetMap); err == nil {
 				jsCallbacks.Call("notifyNetMap", string(jsonNetMap))
@@ -288,11 +302,10 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 	go func() {
 		err := i.lb.Start(ipn.Options{
 			UpdatePrefs: &ipn.Prefs{
-				ControlURL:       i.controlURL,
-				RouteAll:         false,
-				AllowSingleHosts: true,
-				WantRunning:      true,
-				Hostname:         i.hostname,
+				ControlURL:  i.controlURL,
+				RouteAll:    false,
+				WantRunning: true,
+				Hostname:    i.hostname,
 			},
 			AuthKey: i.authKey,
 		})
@@ -313,14 +326,18 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 }
 
 func (i *jsIPN) login() {
-	go i.lb.StartLoginInteractive()
+	go i.lb.StartLoginInteractive(context.Background())
 }
 
 func (i *jsIPN) logout() {
 	if i.lb.State() == ipn.NoState {
 		log.Printf("Backend not running")
 	}
-	go i.lb.Logout()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		i.lb.Logout(ctx)
+	}()
 }
 
 func (i *jsIPN) ssh(host, username string, termConfig js.Value) map[string]any {
@@ -334,10 +351,10 @@ func (i *jsIPN) ssh(host, username string, termConfig js.Value) map[string]any {
 	go jsSSHSession.Run()
 
 	return map[string]any{
-		"close": js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		"close": js.FuncOf(func(this js.Value, args []js.Value) any {
 			return jsSSHSession.Close() != nil
 		}),
-		"resize": js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		"resize": js.FuncOf(func(this js.Value, args []js.Value) any {
 			rows := args[0].Int()
 			cols := args[1].Int()
 			return jsSSHSession.Resize(rows, cols) != nil
@@ -426,7 +443,7 @@ func (s *jsSSHSession) Run() {
 	session.Stdout = termWriter{writeFn}
 	session.Stderr = termWriter{writeFn}
 
-	setReadFn.Invoke(js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+	setReadFn.Invoke(js.FuncOf(func(this js.Value, args []js.Value) any {
 		input := args[0].String()
 		_, err := stdin.Write([]byte(input))
 		if err != nil {
@@ -496,7 +513,7 @@ func (i *jsIPN) fetch(url string) js.Value {
 		return map[string]any{
 			"status":     res.StatusCode,
 			"statusText": res.Status,
-			"text": js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+			"text": js.FuncOf(func(this js.Value, args []js.Value) any {
 				return makePromise(func() (any, error) {
 					defer res.Body.Close()
 					buf := new(bytes.Buffer)
@@ -570,6 +587,14 @@ func mapSlice[T any, M any](a []T, f func(T) M) []M {
 	return n
 }
 
+func mapSliceView[T any, M any](a views.Slice[T], f func(T) M) []M {
+	n := make([]M, a.Len())
+	for i, v := range a.All() {
+		n[i] = f(v)
+	}
+	return n
+}
+
 func filterSlice[T any](a []T, f func(T) bool) []T {
 	n := make([]T, 0, len(a))
 	for _, e := range a {
@@ -583,7 +608,7 @@ func filterSlice[T any](a []T, f func(T) bool) []T {
 func generateHostname() string {
 	tails := words.Tails()
 	scales := words.Scales()
-	if rand.Int()%2 == 0 {
+	if rand.IntN(2) == 0 {
 		// JavaScript
 		tails = filterSlice(tails, func(s string) bool { return strings.HasPrefix(s, "j") })
 		scales = filterSlice(scales, func(s string) bool { return strings.HasPrefix(s, "s") })
@@ -593,8 +618,8 @@ func generateHostname() string {
 		scales = filterSlice(scales, func(s string) bool { return strings.HasPrefix(s, "a") })
 	}
 
-	tail := tails[rand.Intn(len(tails))]
-	scale := scales[rand.Intn(len(scales))]
+	tail := tails[rand.IntN(len(tails))]
+	scale := scales[rand.IntN(len(scales))]
 	return fmt.Sprintf("%s-%s", tail, scale)
 }
 
@@ -602,7 +627,7 @@ func generateHostname() string {
 // f is run on a goroutine and its return value is used to resolve the promise
 // (or reject it if an error is returned).
 func makePromise(f func() (any, error)) js.Value {
-	handler := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+	handler := js.FuncOf(func(this js.Value, args []js.Value) any {
 		resolve := args[0]
 		reject := args[1]
 		go func() {

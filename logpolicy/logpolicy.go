@@ -9,16 +9,17 @@ package logpolicy
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -31,29 +32,30 @@ import (
 	"golang.org/x/term"
 	"tailscale.com/atomicfile"
 	"tailscale.com/envknob"
+	"tailscale.com/health"
+	"tailscale.com/hostinfo"
 	"tailscale.com/log/filelogger"
 	"tailscale.com/logtail"
 	"tailscale.com/logtail/filch"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/netknob"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
-	"tailscale.com/smallzstd"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/must"
 	"tailscale.com/util/racebuild"
-	"tailscale.com/util/winutil"
+	"tailscale.com/util/syspolicy"
+	"tailscale.com/util/testenv"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 )
-
-func inTest() bool { return flag.Lookup("test.v") != nil }
 
 var getLogTargetOnce struct {
 	sync.Once
@@ -62,13 +64,8 @@ var getLogTargetOnce struct {
 
 func getLogTarget() string {
 	getLogTargetOnce.Do(func() {
-		if val, ok := os.LookupEnv("TS_LOG_TARGET"); ok {
-			getLogTargetOnce.v = val
-		} else {
-			if runtime.GOOS == "windows" {
-				getLogTargetOnce.v = winutil.GetRegString("LogTarget", "")
-			}
-		}
+		envTarget, _ := os.LookupEnv("TS_LOG_TARGET")
+		getLogTargetOnce.v, _ = syspolicy.GetString(syspolicy.LogTarget, envTarget)
 	})
 
 	return getLogTargetOnce.v
@@ -109,6 +106,8 @@ type Policy struct {
 	Logtail *logtail.Logger
 	// PublicID is the logger's instance identifier.
 	PublicID logid.PublicID
+	// Logf is where to write informational messages about this Logger.
+	Logf logger.Logf
 }
 
 // NewConfig creates a Config with collection and a newly generated PrivateID.
@@ -232,6 +231,9 @@ func LogsDir(logf logger.Logf) string {
 			logf("logpolicy: using $STATE_DIRECTORY, %q", systemdStateDir)
 			return systemdStateDir
 		}
+	case "js":
+		logf("logpolicy: no logs directory in the browser")
+		return ""
 	}
 
 	// Default to e.g. /var/lib/tailscale or /var/db/tailscale on Unix.
@@ -309,7 +311,7 @@ func winProgramDataAccessible(dir string) bool {
 // log state for that command exists in dir, then the log state is
 // moved from wherever it does exist, into dir. Leftover logs state
 // in / and $CACHE_DIRECTORY is deleted.
-func tryFixLogStateLocation(dir, cmdname string) {
+func tryFixLogStateLocation(dir, cmdname string, logf logger.Logf) {
 	switch runtime.GOOS {
 	case "linux", "freebsd", "openbsd":
 		// These are the OSes where we might have written stuff into
@@ -319,13 +321,13 @@ func tryFixLogStateLocation(dir, cmdname string) {
 		return
 	}
 	if cmdname == "" {
-		log.Printf("[unexpected] no cmdname given to tryFixLogStateLocation, please file a bug at https://github.com/tailscale/tailscale")
+		logf("[unexpected] no cmdname given to tryFixLogStateLocation, please file a bug at https://github.com/tailscale/tailscale")
 		return
 	}
 	if dir == "/" {
 		// Trying to store things in / still. That's a bug, but don't
 		// abort hard.
-		log.Printf("[unexpected] storing logging config in /, please file a bug at https://github.com/tailscale/tailscale")
+		logf("[unexpected] storing logging config in /, please file a bug at https://github.com/tailscale/tailscale")
 		return
 	}
 	if os.Getuid() != 0 {
@@ -382,7 +384,7 @@ func tryFixLogStateLocation(dir, cmdname string) {
 
 	existsInRoot, err := checkExists("/")
 	if err != nil {
-		log.Printf("checking for configs in /: %v", err)
+		logf("checking for configs in /: %v", err)
 		return
 	}
 	existsInCache := false
@@ -390,12 +392,12 @@ func tryFixLogStateLocation(dir, cmdname string) {
 	if cacheDir != "" {
 		existsInCache, err = checkExists("/var/cache/tailscale")
 		if err != nil {
-			log.Printf("checking for configs in %s: %v", cacheDir, err)
+			logf("checking for configs in %s: %v", cacheDir, err)
 		}
 	}
 	existsInDest, err := checkExists(dir)
 	if err != nil {
-		log.Printf("checking for configs in %s: %v", dir, err)
+		logf("checking for configs in %s: %v", dir, err)
 		return
 	}
 
@@ -410,13 +412,13 @@ func tryFixLogStateLocation(dir, cmdname string) {
 		// CACHE_DIRECTORY takes precedence over /, move files from
 		// there.
 		if err := moveFiles(cacheDir); err != nil {
-			log.Print(err)
+			logf("%v", err)
 			return
 		}
 	case existsInRoot:
 		// Files from root is better than nothing.
 		if err := moveFiles("/"); err != nil {
-			log.Print(err)
+			logf("%v", err)
 			return
 		}
 	}
@@ -438,26 +440,78 @@ func tryFixLogStateLocation(dir, cmdname string) {
 			if os.IsNotExist(err) {
 				continue
 			} else if err != nil {
-				log.Printf("stat %q: %v", p, err)
+				logf("stat %q: %v", p, err)
 				return
 			}
 			if err := os.Remove(p); err != nil {
-				log.Printf("rm %q: %v", p, err)
+				logf("rm %q: %v", p, err)
 			}
 		}
 	}
 }
 
-// New returns a new log policy (a logger and its instance ID) for a
-// given collection name.
-func New(collection string) *Policy {
-	return NewWithConfigPath(collection, "", "")
+// Deprecated: Use [Options.New] instead.
+func New(collection string, netMon *netmon.Monitor, health *health.Tracker, logf logger.Logf) *Policy {
+	return Options{
+		Collection: collection,
+		NetMon:     netMon,
+		Health:     health,
+		Logf:       logf,
+	}.New()
 }
 
-// NewWithConfigPath is identical to New,
-// but uses the specified directory and command name.
-// If either is empty, it derives them automatically.
-func NewWithConfigPath(collection, dir, cmdName string) *Policy {
+// Deprecated: Use [Options.New] instead.
+func NewWithConfigPath(collection, dir, cmdName string, netMon *netmon.Monitor, health *health.Tracker, logf logger.Logf) *Policy {
+	return Options{
+		Collection: collection,
+		Dir:        dir,
+		CmdName:    cmdName,
+		NetMon:     netMon,
+		Health:     health,
+		Logf:       logf,
+	}.New()
+}
+
+// Options is used to construct a [Policy].
+type Options struct {
+	// Collection is a required collection to upload logs under.
+	// Collection is a namespace for the type logs.
+	// For example, logs for a node use "tailnode.log.tailscale.io".
+	Collection string
+
+	// Dir is an optional directory to store the log configuration.
+	// If empty, [LogsDir] is used.
+	Dir string
+
+	// CmdName is an optional name of the current binary.
+	// If empty, [version.CmdName] is used.
+	CmdName string
+
+	// NetMon is an optional parameter for monitoring.
+	// If non-nil, it's used to do faster interface lookups.
+	NetMon *netmon.Monitor
+
+	// Health is an optional parameter for health status.
+	// If non-nil, it's used to construct the default HTTP client.
+	Health *health.Tracker
+
+	// Logf is an optional logger to use.
+	// If nil, [log.Printf] will be used instead.
+	Logf logger.Logf
+
+	// HTTPC is an optional client to use upload logs.
+	// If nil, [TransportOptions.New] is used to construct a new client
+	// with that particular transport sending logs to the default logs server.
+	HTTPC *http.Client
+}
+
+// New returns a new log policy (a logger and its instance ID).
+func (opts Options) New() *Policy {
+	if hostinfo.IsNATLabGuestVM() {
+		// In NATLab Gokrazy instances, tailscaled comes up concurently with
+		// DHCP and the doesn't have DNS for a while. Wait for DHCP first.
+		awaitGokrazyNetwork()
+	}
 	var lflags int
 	if term.IsTerminal(2) || runtime.GOOS == "windows" {
 		lflags = 0
@@ -480,18 +534,23 @@ func NewWithConfigPath(collection, dir, cmdName string) *Policy {
 		earlyErrBuf.WriteByte('\n')
 	}
 
-	if dir == "" {
-		dir = LogsDir(earlyLogf)
+	if opts.Dir == "" {
+		opts.Dir = LogsDir(earlyLogf)
 	}
-	if cmdName == "" {
-		cmdName = version.CmdName()
+	if opts.CmdName == "" {
+		opts.CmdName = version.CmdName()
 	}
-	tryFixLogStateLocation(dir, cmdName)
 
-	cfgPath := filepath.Join(dir, fmt.Sprintf("%s.log.conf", cmdName))
+	useStdLogger := opts.Logf == nil
+	if useStdLogger {
+		opts.Logf = log.Printf
+	}
+	tryFixLogStateLocation(opts.Dir, opts.CmdName, opts.Logf)
+
+	cfgPath := filepath.Join(opts.Dir, fmt.Sprintf("%s.log.conf", opts.CmdName))
 
 	if runtime.GOOS == "windows" {
-		switch cmdName {
+		switch opts.CmdName {
 		case "tailscaled":
 			// Tailscale 1.14 and before stored state under %LocalAppData%
 			// (usually "C:\WINDOWS\system32\config\systemprofile\AppData\Local"
@@ -522,7 +581,7 @@ func NewWithConfigPath(collection, dir, cmdName string) *Policy {
 			cfgPath = paths.TryConfigFileMigration(earlyLogf, oldPath, cfgPath)
 		case "tailscale-ipn":
 			for _, oldBase := range []string{"wg64.log.conf", "wg32.log.conf"} {
-				oldConf := filepath.Join(dir, oldBase)
+				oldConf := filepath.Join(opts.Dir, oldBase)
 				if fi, err := os.Stat(oldConf); err == nil && fi.Mode().IsRegular() {
 					cfgPath = paths.TryConfigFileMigration(earlyLogf, oldConf, cfgPath)
 					break
@@ -535,43 +594,89 @@ func NewWithConfigPath(collection, dir, cmdName string) *Policy {
 	if err != nil {
 		earlyLogf("logpolicy.ConfigFromFile %v: %v", cfgPath, err)
 	}
-	if err := newc.Validate(collection); err != nil {
+	if err := newc.Validate(opts.Collection); err != nil {
 		earlyLogf("logpolicy.Config.Validate for %v: %v", cfgPath, err)
-		newc = NewConfig(collection)
+		newc = NewConfig(opts.Collection)
 		if err := newc.Save(cfgPath); err != nil {
 			earlyLogf("logpolicy.Config.Save for %v: %v", cfgPath, err)
 		}
 	}
 
 	conf := logtail.Config{
-		Collection: newc.Collection,
-		PrivateID:  newc.PrivateID,
-		Stderr:     logWriter{console},
-		NewZstdEncoder: func() logtail.Encoder {
-			w, err := smallzstd.NewEncoder(nil)
-			if err != nil {
-				panic(err)
-			}
-			return w
-		},
-		HTTPC: &http.Client{Transport: NewLogtailTransport(logtail.DefaultHost)},
+		Collection:   newc.Collection,
+		PrivateID:    newc.PrivateID,
+		Stderr:       logWriter{console},
+		CompressLogs: true,
 	}
-	if collection == logtail.CollectionNode {
+	if opts.Collection == logtail.CollectionNode {
 		conf.MetricsDelta = clientmetric.EncodeLogTailMetricsDelta
 		conf.IncludeProcID = true
 		conf.IncludeProcSequence = true
 	}
 
-	if envknob.NoLogsNoSupport() || inTest() {
-		log.Println("You have disabled logging. Tailscale will not be able to provide support.")
+	if envknob.NoLogsNoSupport() || testenv.InTest() {
+		opts.Logf("You have disabled logging. Tailscale will not be able to provide support.")
 		conf.HTTPC = &http.Client{Transport: noopPretendSuccessTransport{}}
-	} else if val := getLogTarget(); val != "" {
-		log.Println("You have enabled a non-default log target. Doing without being told to by Tailscale staff or your network administrator will make getting support difficult.")
-		conf.BaseURL = val
-		u, _ := url.Parse(val)
-		conf.HTTPC = &http.Client{Transport: NewLogtailTransport(u.Host)}
+	} else {
+		// Only attach an on-disk filch buffer if we are going to be sending logs.
+		// No reason to persist them locally just to drop them later.
+		attachFilchBuffer(&conf, opts.Dir, opts.CmdName, opts.Logf)
+		conf.HTTPC = opts.HTTPC
+
+		if conf.HTTPC == nil {
+			logHost := logtail.DefaultHost
+			if val := getLogTarget(); val != "" {
+				opts.Logf("You have enabled a non-default log target. Doing without being told to by Tailscale staff or your network administrator will make getting support difficult.")
+				conf.BaseURL = val
+				u, _ := url.Parse(val)
+				logHost = u.Host
+			}
+			conf.HTTPC = &http.Client{Transport: TransportOptions{
+				Host:   logHost,
+				NetMon: opts.NetMon,
+				Health: opts.Health,
+				Logf:   opts.Logf,
+			}.New()}
+		}
+	}
+	lw := logtail.NewLogger(conf, opts.Logf)
+
+	var logOutput io.Writer = lw
+
+	if runtime.GOOS == "windows" && conf.Collection == logtail.CollectionNode {
+		logID := newc.PublicID.String()
+		exe, _ := os.Executable()
+		if strings.EqualFold(filepath.Base(exe), "tailscaled.exe") {
+			diskLogf := filelogger.New("tailscale-service", logID, lw.Logf)
+			logOutput = logger.FuncWriter(diskLogf)
+		}
 	}
 
+	if useStdLogger {
+		log.SetFlags(0) // other log flags are set on console, not here
+		log.SetOutput(logOutput)
+	}
+
+	opts.Logf("Program starting: v%v, Go %v: %#v",
+		version.Long(),
+		goVersion(),
+		os.Args)
+	opts.Logf("LogID: %v", newc.PublicID)
+	if earlyErrBuf.Len() != 0 {
+		opts.Logf("%s", earlyErrBuf.Bytes())
+	}
+
+	return &Policy{
+		Logtail:  lw,
+		PublicID: newc.PublicID,
+		Logf:     opts.Logf,
+	}
+}
+
+// attachFilchBuffer creates an on-disk ring buffer using filch and attaches
+// it to the logtail config. Note that this is optional; if no buffer is set,
+// logtail will use an in-memory buffer.
+func attachFilchBuffer(conf *logtail.Config, dir, cmdName string, logf logger.Logf) {
 	filchOptions := filch.Options{
 		ReplaceStderr: redirectStderrToLogPanics(),
 	}
@@ -586,7 +691,7 @@ func NewWithConfigPath(collection, dir, cmdName string) *Policy {
 			filchOptions.MaxFileSize = 1 << 20
 		} else {
 			// not a fatal error, we can leave the log files on the spinning disk
-			log.Printf("Unable to create /tmp directory for log storage: %v\n", err)
+			logf("Unable to create /tmp directory for log storage: %v\n", err)
 		}
 	}
 
@@ -597,37 +702,8 @@ func NewWithConfigPath(collection, dir, cmdName string) *Policy {
 			conf.Stderr = filchBuf.OrigStderr
 		}
 	}
-	lw := logtail.NewLogger(conf, log.Printf)
-
-	var logOutput io.Writer = lw
-
-	if runtime.GOOS == "windows" && conf.Collection == logtail.CollectionNode {
-		logID := newc.PublicID.String()
-		exe, _ := os.Executable()
-		if strings.EqualFold(filepath.Base(exe), "tailscaled.exe") {
-			diskLogf := filelogger.New("tailscale-service", logID, lw.Logf)
-			logOutput = logger.FuncWriter(diskLogf)
-		}
-	}
-
-	log.SetFlags(0) // other log flags are set on console, not here
-	log.SetOutput(logOutput)
-
-	log.Printf("Program starting: v%v, Go %v: %#v",
-		version.Long(),
-		goVersion(),
-		os.Args)
-	log.Printf("LogID: %v", newc.PublicID)
 	if filchErr != nil {
-		log.Printf("filch failed: %v", filchErr)
-	}
-	if earlyErrBuf.Len() != 0 {
-		log.Printf("%s", earlyErrBuf.Bytes())
-	}
-
-	return &Policy{
-		Logtail:  lw,
-		PublicID: newc.PublicID,
+		logf("filch failed: %v", filchErr)
 	}
 }
 
@@ -664,19 +740,32 @@ func (p *Policy) Close() {
 // log upload if it can be done before ctx is canceled.
 func (p *Policy) Shutdown(ctx context.Context) error {
 	if p.Logtail != nil {
-		log.Printf("flushing log.")
+		p.Logf("flushing log.")
 		return p.Logtail.Shutdown(ctx)
 	}
 	return nil
 }
 
-// DialContext is a net.Dialer.DialContext specialized for use by logtail.
+// MakeDialFunc creates a net.Dialer.DialContext function specialized for use
+// by logtail.
 // It does the following:
 //   - If DNS lookup fails, consults the bootstrap DNS list of Tailscale hostnames.
 //   - If TLS connection fails, try again using LetsEncrypt's built-in root certificate,
 //     for the benefit of older OS platforms which might not include it.
-func DialContext(ctx context.Context, netw, addr string) (net.Conn, error) {
-	nd := netns.FromDialer(log.Printf, &net.Dialer{
+//
+// The netMon parameter is optional. It should be specified in environments where
+// Tailscaled is manipulating the routing table.
+func MakeDialFunc(netMon *netmon.Monitor, logf logger.Logf) func(ctx context.Context, netw, addr string) (net.Conn, error) {
+	if netMon == nil {
+		netMon = netmon.NewStatic()
+	}
+	return func(ctx context.Context, netw, addr string) (net.Conn, error) {
+		return dialContext(ctx, netw, addr, netMon, logf)
+	}
+}
+
+func dialContext(ctx context.Context, netw, addr string, netMon *netmon.Monitor, logf logger.Logf) (net.Conn, error) {
+	nd := netns.FromDialer(logf, netMon, &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: netknob.PlatformTCPKeepAlive(),
 	})
@@ -689,7 +778,7 @@ func DialContext(ctx context.Context, netw, addr string) (net.Conn, error) {
 	}
 
 	if version.IsWindowsGUI() && strings.HasPrefix(netw, "tcp") {
-		if c, err := safesocket.Connect(safesocket.DefaultConnectionStrategy("")); err == nil {
+		if c, err := safesocket.ConnectContext(ctx, ""); err == nil {
 			fmt.Fprintf(c, "CONNECT %s HTTP/1.0\r\n\r\n", addr)
 			br := bufio.NewReader(c)
 			res, err := http.ReadResponse(br, nil)
@@ -697,7 +786,7 @@ func DialContext(ctx context.Context, netw, addr string) (net.Conn, error) {
 				err = errors.New(res.Status)
 			}
 			if err != nil {
-				log.Printf("logtail: CONNECT response error from tailscaled: %v", err)
+				logf("logtail: CONNECT response error from tailscaled: %v", err)
 				c.Close()
 			} else {
 				dialLog.Printf("connected via tailscaled")
@@ -707,28 +796,62 @@ func DialContext(ctx context.Context, netw, addr string) (net.Conn, error) {
 	}
 
 	// If we failed to dial, try again with bootstrap DNS.
-	log.Printf("logtail: dial %q failed: %v (in %v), trying bootstrap...", addr, err, d)
+	logf("logtail: dial %q failed: %v (in %v), trying bootstrap...", addr, err, d)
 	dnsCache := &dnscache.Resolver{
 		Forward:          dnscache.Get().Forward, // use default cache's forwarder
 		UseLastGood:      true,
-		LookupIPFallback: dnsfallback.Lookup,
+		LookupIPFallback: dnsfallback.MakeLookupFunc(logf, netMon),
 	}
 	dialer := dnscache.Dialer(nd.DialContext, dnsCache)
 	c, err = dialer(ctx, netw, addr)
 	if err == nil {
-		log.Printf("logtail: bootstrap dial succeeded")
+		logf("logtail: bootstrap dial succeeded")
 	}
 	return c, err
 }
 
-// NewLogtailTransport returns an HTTP Transport particularly suited to uploading
-// logs to the given host name. See DialContext for details on how it works.
-func NewLogtailTransport(host string) http.RoundTripper {
-	if inTest() {
+// Deprecated: Use [TransportOptions.New] instead.
+func NewLogtailTransport(host string, netMon *netmon.Monitor, health *health.Tracker, logf logger.Logf) http.RoundTripper {
+	return TransportOptions{Host: host, NetMon: netMon, Health: health, Logf: logf}.New()
+}
+
+// TransportOptions is used to construct an [http.RoundTripper].
+type TransportOptions struct {
+	// Host is the optional hostname of the logs server.
+	// If empty, then [logtail.DefaultHost] is used.
+	Host string
+
+	// NetMon is an optional parameter for monitoring.
+	// If non-nil, it's used to do faster interface lookups.
+	NetMon *netmon.Monitor
+
+	// Health is an optional parameter for health status.
+	// If non-nil, it's used to construct the default HTTP client.
+	Health *health.Tracker
+
+	// Logf is an optional logger to use.
+	// If nil, [log.Printf] will be used instead.
+	Logf logger.Logf
+
+	// TLSClientConfig is an optional TLS configuration to use.
+	// If non-nil, the configuration will be cloned.
+	TLSClientConfig *tls.Config
+}
+
+// New returns an HTTP Transport particularly suited to uploading logs
+// to the given host name. See [DialContext] for details on how it works.
+func (opts TransportOptions) New() http.RoundTripper {
+	if testenv.InTest() {
 		return noopPretendSuccessTransport{}
+	}
+	if opts.NetMon == nil {
+		opts.NetMon = netmon.NewStatic()
 	}
 	// Start with a copy of http.DefaultTransport and tweak it a bit.
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if opts.TLSClientConfig != nil {
+		tr.TLSClientConfig = opts.TLSClientConfig.Clone()
+	}
 
 	tr.Proxy = tshttpproxy.ProxyFromEnvironment
 	tshttpproxy.SetTransportGetProxyConnectHeader(tr)
@@ -739,7 +862,15 @@ func NewLogtailTransport(host string) http.RoundTripper {
 	tr.DisableCompression = true
 
 	// Log whenever we dial:
-	tr.DialContext = DialContext
+	if opts.Logf == nil {
+		opts.Logf = log.Printf
+	}
+	tr.DialContext = MakeDialFunc(opts.NetMon, opts.Logf)
+
+	// We're uploading logs ideally infrequently, with specific timing that will
+	// change over time. Try to keep the connection open, to avoid repeatedly
+	// paying the cost of TLS setup.
+	tr.IdleConnTimeout = time.Hour
 
 	// We're contacting exactly 1 hostname, so the default's 100
 	// max idle conns is very high for our needs. Even 2 is
@@ -756,7 +887,10 @@ func NewLogtailTransport(host string) http.RoundTripper {
 		tr.TLSNextProto = map[string]func(authority string, c *tls.Conn) http.RoundTripper{}
 	}
 
-	tr.TLSClientConfig = tlsdial.Config(host, tr.TLSClientConfig)
+	host := cmp.Or(opts.Host, logtail.DefaultHost)
+	tr.TLSClientConfig = tlsdial.Config(host, opts.Health, tr.TLSClientConfig)
+	// Force TLS 1.3 since we know log.tailscale.com supports it.
+	tr.TLSClientConfig.MinVersion = tls.VersionTLS13
 
 	return tr
 }
@@ -778,4 +912,62 @@ func (noopPretendSuccessTransport) RoundTrip(req *http.Request) (*http.Response,
 		StatusCode: 200,
 		Status:     "200 OK",
 	}, nil
+}
+
+func awaitGokrazyNetwork() {
+	if runtime.GOOS != "linux" || distro.Get() != distro.Gokrazy {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	for {
+		// Before DHCP finishes, the /etc/resolv.conf file has just "#MANUAL".
+		all, _ := os.ReadFile("/etc/resolv.conf")
+		if bytes.Contains(all, []byte("nameserver ")) {
+			good := true
+			firstLine, _, ok := strings.Cut(string(all), "\n")
+			if ok {
+				ns, ok := strings.CutPrefix(firstLine, "nameserver ")
+				if ok {
+					if ip, err := netip.ParseAddr(ns); err == nil && ip.Is6() && !ip.IsLinkLocalUnicast() {
+						good = haveGlobalUnicastIPv6()
+					}
+				}
+			}
+			if good {
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// haveGlobalUnicastIPv6 reports whether the machine has a IPv6 non-private
+// (non-ULA) global unicast address.
+//
+// It's only intended for use in natlab integration tests so only works on
+// Linux/macOS now and not environments (such as Android) where net.Interfaces
+// doesn't work directly.
+func haveGlobalUnicastIPv6() bool {
+	ifs, _ := net.Interfaces()
+	for _, ni := range ifs {
+		aa, _ := ni.Addrs()
+		for _, a := range aa {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip, _ := netip.AddrFromSlice(ipn.IP)
+			if ip.Is6() && ip.IsGlobalUnicast() && !ip.IsPrivate() {
+				return true
+			}
+		}
+	}
+	return false
 }

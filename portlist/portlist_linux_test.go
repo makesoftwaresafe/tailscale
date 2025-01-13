@@ -56,7 +56,7 @@ func TestParsePorts(t *testing.T) {
   2: 5501A8C0:ADD4 B25E9536:01BB 01 00000000:00000000 02:00000B2B 00000000  1000        0 155276677 2 0000000000000000 22 4 30 10 -1
 `,
 			want: map[string]*portMeta{
-				"socket:[34062]": &portMeta{
+				"socket:[34062]": {
 					port: Port{Proto: "tcp", Port: 22},
 				},
 			},
@@ -71,10 +71,10 @@ func TestParsePorts(t *testing.T) {
    3: 69050120005716BC64906EBE009ECD4D:D506 0047062600000000000000006E171268:01BB 01 00000000:00000000 02:0000009E 00000000  1000        0 151042856 2 0000000000000000 21 4 28 10 -1
 `,
 			want: map[string]*portMeta{
-				"socket:[142240557]": &portMeta{
+				"socket:[142240557]": {
 					port: Port{Proto: "tcp", Port: 8081},
 				},
-				"socket:[34064]": &portMeta{
+				"socket:[34064]": {
 					port: Port{Proto: "tcp", Port: 22},
 				},
 			},
@@ -89,7 +89,7 @@ func TestParsePorts(t *testing.T) {
 			if tt.file != "" {
 				file = tt.file
 			}
-			li := newLinuxImplBase()
+			li := newLinuxImplBase(false)
 			err := li.parseProcNetFile(r, file)
 			if err != nil {
 				t.Fatal(err)
@@ -114,16 +114,16 @@ func BenchmarkParsePorts(b *testing.B) {
    1: 00000000000000000000000000000000:1F91 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 142240557 1 0000000000000000 100 0 0 10 0
    2: 00000000000000000000000000000000:0016 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 34064 1 0000000000000000 100 0 0 10 0
 `)
-	for i := 0; i < 50000; i++ {
+	for range 50000 {
 		contents.WriteString("   3: 69050120005716BC64906EBE009ECD4D:D506 0047062600000000000000006E171268:01BB 01 00000000:00000000 02:0000009E 00000000  1000        0 151042856 2 0000000000000000 21 4 28 10 -1\n")
 	}
 
-	li := newLinuxImplBase()
+	li := newLinuxImplBase(false)
 
 	r := bytes.NewReader(contents.Bytes())
 	br := bufio.NewReader(&contents)
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		r.Seek(0, io.SeekStart)
 		br.Reset(r)
 		err := li.parseProcNetFile(br, "tcp6")
@@ -142,7 +142,7 @@ func BenchmarkFindProcessNames(b *testing.B) {
 	need := map[string]*portMeta{
 		"something-we'll-never-find": new(portMeta),
 	}
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		if err := li.findProcessNames(need); err != nil {
 			b.Fatal(err)
 		}

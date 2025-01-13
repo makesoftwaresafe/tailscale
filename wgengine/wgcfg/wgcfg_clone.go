@@ -11,6 +11,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logid"
+	"tailscale.com/types/ptr"
 )
 
 // Clone makes a deep copy of Config.
@@ -23,9 +24,11 @@ func (src *Config) Clone() *Config {
 	*dst = *src
 	dst.Addresses = append(src.Addresses[:0:0], src.Addresses...)
 	dst.DNS = append(src.DNS[:0:0], src.DNS...)
-	dst.Peers = make([]Peer, len(src.Peers))
-	for i := range dst.Peers {
-		dst.Peers[i] = *src.Peers[i].Clone()
+	if src.Peers != nil {
+		dst.Peers = make([]Peer, len(src.Peers))
+		for i := range dst.Peers {
+			dst.Peers[i] = *src.Peers[i].Clone()
+		}
 	}
 	return dst
 }
@@ -40,8 +43,9 @@ var _ConfigCloneNeedsRegeneration = Config(struct {
 	DNS            []netip.Addr
 	Peers          []Peer
 	NetworkLogging struct {
-		NodeID   logid.PrivateID
-		DomainID logid.PrivateID
+		NodeID             logid.PrivateID
+		DomainID           logid.PrivateID
+		LogExitFlowEnabled bool
 	}
 }{})
 
@@ -54,6 +58,12 @@ func (src *Peer) Clone() *Peer {
 	dst := new(Peer)
 	*dst = *src
 	dst.AllowedIPs = append(src.AllowedIPs[:0:0], src.AllowedIPs...)
+	if dst.V4MasqAddr != nil {
+		dst.V4MasqAddr = ptr.To(*src.V4MasqAddr)
+	}
+	if dst.V6MasqAddr != nil {
+		dst.V6MasqAddr = ptr.To(*src.V6MasqAddr)
+	}
 	return dst
 }
 
@@ -62,6 +72,9 @@ var _PeerCloneNeedsRegeneration = Peer(struct {
 	PublicKey           key.NodePublic
 	DiscoKey            key.DiscoPublic
 	AllowedIPs          []netip.Prefix
+	V4MasqAddr          *netip.Addr
+	V6MasqAddr          *netip.Addr
+	IsJailed            bool
 	PersistentKeepalive uint16
 	WGEndpoint          key.NodePublic
 }{})

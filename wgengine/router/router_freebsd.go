@@ -5,8 +5,9 @@ package router
 
 import (
 	"github.com/tailscale/wireguard-go/tun"
+	"tailscale.com/health"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
-	"tailscale.com/wgengine/monitor"
 )
 
 // For now this router only supports the userspace WireGuard implementations.
@@ -14,11 +15,11 @@ import (
 // Work is currently underway for an in-kernel FreeBSD implementation of wireguard
 // https://svnweb.freebsd.org/base?view=revision&revision=357986
 
-func newUserspaceRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor.Mon) (Router, error) {
-	return newUserspaceBSDRouter(logf, tundev, linkMon)
+func newUserspaceRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor, health *health.Tracker) (Router, error) {
+	return newUserspaceBSDRouter(logf, tundev, netMon, health)
 }
 
-func cleanup(logf logger.Logf, interfaceName string) {
+func cleanUp(logf logger.Logf, interfaceName string) {
 	// If the interface was left behind, ifconfig down will not remove it.
 	// In fact, this will leave a system in a tainted state where starting tailscaled
 	// will result in "interface tailscale0 already exists"

@@ -6,7 +6,7 @@ package netns
 import (
 	"testing"
 
-	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netmon"
 )
 
 func TestGetInterfaceIndex(t *testing.T) {
@@ -34,7 +34,7 @@ func TestGetInterfaceIndex(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			idx, err := getInterfaceIndex(t.Logf, tc.addr)
+			idx, err := getInterfaceIndex(t.Logf, nil, tc.addr)
 			if err != nil {
 				if tc.err == "" {
 					t.Fatalf("got unexpected error: %v", err)
@@ -55,7 +55,7 @@ func TestGetInterfaceIndex(t *testing.T) {
 	}
 
 	t.Run("NoTailscale", func(t *testing.T) {
-		_, tsif, err := interfaces.Tailscale()
+		tsif, err := tailscaleInterface()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -63,12 +63,12 @@ func TestGetInterfaceIndex(t *testing.T) {
 			t.Skip("no tailscale interface on this machine")
 		}
 
-		defaultIdx, err := interfaces.DefaultRouteInterfaceIndex()
+		defaultIdx, err := netmon.DefaultRouteInterfaceIndex()
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		idx, err := getInterfaceIndex(t.Logf, "100.100.100.100:53")
+		idx, err := getInterfaceIndex(t.Logf, nil, "100.100.100.100:53")
 		if err != nil {
 			t.Fatal(err)
 		}

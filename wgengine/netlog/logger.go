@@ -16,11 +16,13 @@ import (
 	"sync"
 	"time"
 
+	"tailscale.com/health"
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail"
 	"tailscale.com/net/connstats"
+	"tailscale.com/net/netmon"
+	"tailscale.com/net/sockstats"
 	"tailscale.com/net/tsaddr"
-	"tailscale.com/smallzstd"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/netlogtype"
@@ -90,7 +92,8 @@ var testClient *http.Client
 // is a non-tailscale IP address to contact for that particular tailscale node.
 // The IP protocol and source port are always zero.
 // The sock is used to populated the PhysicalTraffic field in Message.
-func (nl *Logger) Startup(nodeID tailcfg.StableNodeID, nodeLogID, domainLogID logid.PrivateID, tun, sock Device) error {
+// The netMon parameter is optional; if non-nil it's used to do faster interface lookups.
+func (nl *Logger) Startup(nodeID tailcfg.StableNodeID, nodeLogID, domainLogID logid.PrivateID, tun, sock Device, netMon *netmon.Monitor, health *health.Tracker, logExitFlowEnabledEnabled bool) error {
 	nl.mu.Lock()
 	defer nl.mu.Unlock()
 	if nl.logger != nil {
@@ -98,7 +101,8 @@ func (nl *Logger) Startup(nodeID tailcfg.StableNodeID, nodeLogID, domainLogID lo
 	}
 
 	// Startup a log stream to Tailscale's logging service.
-	httpc := &http.Client{Transport: logpolicy.NewLogtailTransport(logtail.DefaultHost)}
+	logf := log.Printf
+	httpc := &http.Client{Transport: logpolicy.NewLogtailTransport(logtail.DefaultHost, netMon, health, logf)}
 	if testClient != nil {
 		httpc = testClient
 	}
@@ -107,20 +111,15 @@ func (nl *Logger) Startup(nodeID tailcfg.StableNodeID, nodeLogID, domainLogID lo
 		PrivateID:     nodeLogID,
 		CopyPrivateID: domainLogID,
 		Stderr:        io.Discard,
+		CompressLogs:  true,
+		HTTPC:         httpc,
 		// TODO(joetsai): Set Buffer? Use an in-memory buffer for now.
-		NewZstdEncoder: func() logtail.Encoder {
-			w, err := smallzstd.NewEncoder(nil)
-			if err != nil {
-				panic(err)
-			}
-			return w
-		},
-		HTTPC: httpc,
 
 		// Include process sequence numbers to identify missing samples.
 		IncludeProcID:       true,
 		IncludeProcSequence: true,
-	}, log.Printf)
+	}, logf)
+	nl.logger.SetSockstatsLabel(sockstats.LabelNetlogLogger)
 
 	// Startup a data structure to track per-connection statistics.
 	// There is a maximum size for individual log messages that logtail
@@ -132,7 +131,7 @@ func (nl *Logger) Startup(nodeID tailcfg.StableNodeID, nodeLogID, domainLogID lo
 		addrs := nl.addrs
 		prefixes := nl.prefixes
 		nl.mu.Unlock()
-		recordStatistics(nl.logger, nodeID, start, end, virtual, physical, addrs, prefixes)
+		recordStatistics(nl.logger, nodeID, start, end, virtual, physical, addrs, prefixes, logExitFlowEnabledEnabled)
 	})
 
 	// Register the connection tracker into the TUN device.
@@ -152,7 +151,7 @@ func (nl *Logger) Startup(nodeID tailcfg.StableNodeID, nodeLogID, domainLogID lo
 	return nil
 }
 
-func recordStatistics(logger *logtail.Logger, nodeID tailcfg.StableNodeID, start, end time.Time, connstats, sockStats map[netlogtype.Connection]netlogtype.Counts, addrs map[netip.Addr]bool, prefixes map[netip.Prefix]bool) {
+func recordStatistics(logger *logtail.Logger, nodeID tailcfg.StableNodeID, start, end time.Time, connstats, sockStats map[netlogtype.Connection]netlogtype.Counts, addrs map[netip.Addr]bool, prefixes map[netip.Prefix]bool, logExitFlowEnabled bool) {
 	m := netlogtype.Message{NodeID: nodeID, Start: start.UTC(), End: end.UTC()}
 
 	classifyAddr := func(a netip.Addr) (isTailscale, withinRoute bool) {
@@ -181,7 +180,7 @@ func recordStatistics(logger *logtail.Logger, nodeID tailcfg.StableNodeID, start
 			m.SubnetTraffic = append(m.SubnetTraffic, netlogtype.ConnectionCounts{Connection: conn, Counts: cnts})
 		default:
 			const anonymize = true
-			if anonymize {
+			if anonymize && !logExitFlowEnabled {
 				// Only preserve the address if it is a Tailscale IP address.
 				srcOrig, dstOrig := conn.Src, conn.Dst
 				conn = netlogtype.Connection{} // scrub everything by default

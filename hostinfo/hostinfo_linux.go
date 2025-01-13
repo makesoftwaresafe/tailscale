@@ -12,7 +12,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"tailscale.com/types/ptr"
-	"tailscale.com/util/lineread"
+	"tailscale.com/util/lineiter"
 	"tailscale.com/version/distro"
 )
 
@@ -22,9 +22,7 @@ func init() {
 	distroName = distroNameLinux
 	distroVersion = distroVersionLinux
 	distroCodeName = distroCodeNameLinux
-	if v := linuxDeviceModel(); v != "" {
-		SetDeviceModel(v)
-	}
+	deviceModel = deviceModelLinux
 }
 
 var (
@@ -50,7 +48,7 @@ func distroCodeNameLinux() string {
 	return lazyVersionMeta.Get().DistroCodeName
 }
 
-func linuxDeviceModel() string {
+func deviceModelLinux() string {
 	for _, path := range []string{
 		// First try the Synology-specific location.
 		// Example: "DS916+-j"
@@ -95,6 +93,8 @@ func linuxVersionMeta() (meta versionMeta) {
 		propFile = "/etc.defaults/VERSION"
 	case distro.OpenWrt:
 		propFile = "/etc/openwrt_release"
+	case distro.Unraid:
+		propFile = "/etc/unraid-version"
 	case distro.WDMyCloud:
 		slurp, _ := os.ReadFile("/etc/version")
 		meta.DistroVersion = string(bytes.TrimSpace(slurp))
@@ -106,15 +106,18 @@ func linuxVersionMeta() (meta versionMeta) {
 	}
 
 	m := map[string]string{}
-	lineread.File(propFile, func(line []byte) error {
+	for lr := range lineiter.File(propFile) {
+		line, err := lr.Value()
+		if err != nil {
+			break
+		}
 		eq := bytes.IndexByte(line, '=')
 		if eq == -1 {
-			return nil
+			continue
 		}
 		k, v := string(line[:eq]), strings.Trim(string(line[eq+1:]), `"'`)
 		m[k] = v
-		return nil
-	})
+	}
 
 	if v := m["VERSION_CODENAME"]; v != "" {
 		meta.DistroCodeName = v
@@ -153,11 +156,20 @@ func linuxVersionMeta() (meta versionMeta) {
 		meta.DistroVersion = m["productversion"]
 	case distro.OpenWrt:
 		meta.DistroVersion = m["DISTRIB_RELEASE"]
+	case distro.Unraid:
+		meta.DistroVersion = m["version"]
 	}
 	return
 }
 
+// linuxBuildTagPackageType is set by packagetype_*.go
+// build tag guarded files.
+var linuxBuildTagPackageType string
+
 func packageTypeLinux() string {
+	if v := linuxBuildTagPackageType; v != "" {
+		return v
+	}
 	// Report whether this is in a snap.
 	// See https://snapcraft.io/docs/environment-variables
 	// We just look at two somewhat arbitrarily.

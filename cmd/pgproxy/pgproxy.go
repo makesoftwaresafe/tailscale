@@ -28,7 +28,6 @@ import (
 	"tailscale.com/metrics"
 	"tailscale.com/tsnet"
 	"tailscale.com/tsweb"
-	"tailscale.com/types/logger"
 )
 
 var (
@@ -58,8 +57,6 @@ func main() {
 	ts := &tsnet.Server{
 		Dir:      *tailscaleDir,
 		Hostname: *hostname,
-		// Make the stdout logs a clean audit log of connections.
-		Logf: logger.Discard,
 	}
 
 	if os.Getenv("TS_AUTHKEY") == "" {
@@ -272,7 +269,7 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 	}
 	if buf[0] != 'S' {
 		p.errors.Add("upstream-bad-protocol", 1)
-		return fmt.Errorf("upstream didn't acknowldge start-ssl, said %q", buf[0])
+		return fmt.Errorf("upstream didn't acknowledge start-ssl, said %q", buf[0])
 	}
 	tlsConf := &tls.Config{
 		ServerName: p.upstreamHost,

@@ -1,17 +1,20 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !tailscale_go || !(darwin || ios || android)
+//go:build !tailscale_go || !(darwin || ios || android || ts_enable_sockstats)
 
 package sockstats
 
 import (
 	"context"
+
+	"tailscale.com/net/netmon"
+	"tailscale.com/types/logger"
 )
 
 const IsAvailable = false
 
-func withSockStats(ctx context.Context, label Label) context.Context {
+func withSockStats(ctx context.Context, label Label, logf logger.Logf) context.Context {
 	return ctx
 }
 
@@ -27,5 +30,9 @@ func getValidation() *ValidationSockStats {
 	return nil
 }
 
-func setLinkMonitor(lm LinkMonitor) {
+func setNetMon(netMon *netmon.Monitor) {
+}
+
+func debugInfo() string {
+	return ""
 }

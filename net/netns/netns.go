@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 
 	"tailscale.com/net/netknob"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
 )
 
@@ -37,7 +38,7 @@ var bindToInterfaceByRoute atomic.Bool
 // route information to bind to a particular interface. It is the same as
 // setting the TS_BIND_TO_INTERFACE_BY_ROUTE.
 //
-// Currently, this only changes the behaviour on macOS.
+// Currently, this only changes the behaviour on macOS and Windows.
 func SetBindToInterfaceByRoute(v bool) {
 	bindToInterfaceByRoute.Store(v)
 }
@@ -55,19 +56,25 @@ func SetDisableBindConnToInterface(v bool) {
 // Listener returns a new net.Listener with its Control hook func
 // initialized as necessary to run in logical network namespace that
 // doesn't route back into Tailscale.
-func Listener(logf logger.Logf) *net.ListenConfig {
+func Listener(logf logger.Logf, netMon *netmon.Monitor) *net.ListenConfig {
+	if netMon == nil {
+		panic("netns.Listener called with nil netMon")
+	}
 	if disabled.Load() {
 		return new(net.ListenConfig)
 	}
-	return &net.ListenConfig{Control: control(logf)}
+	return &net.ListenConfig{Control: control(logf, netMon)}
 }
 
 // NewDialer returns a new Dialer using a net.Dialer with its Control
 // hook func initialized as necessary to run in a logical network
 // namespace that doesn't route back into Tailscale. It also handles
 // using a SOCKS if configured in the environment with ALL_PROXY.
-func NewDialer(logf logger.Logf) Dialer {
-	return FromDialer(logf, &net.Dialer{
+func NewDialer(logf logger.Logf, netMon *netmon.Monitor) Dialer {
+	if netMon == nil {
+		panic("netns.NewDialer called with nil netMon")
+	}
+	return FromDialer(logf, netMon, &net.Dialer{
 		KeepAlive: netknob.PlatformTCPKeepAlive(),
 	})
 }
@@ -76,11 +83,14 @@ func NewDialer(logf logger.Logf) Dialer {
 // network namespace that doesn't route back into Tailscale. It also
 // handles using a SOCKS if configured in the environment with
 // ALL_PROXY.
-func FromDialer(logf logger.Logf, d *net.Dialer) Dialer {
+func FromDialer(logf logger.Logf, netMon *netmon.Monitor, d *net.Dialer) Dialer {
+	if netMon == nil {
+		panic("netns.FromDialer called with nil netMon")
+	}
 	if disabled.Load() {
 		return d
 	}
-	d.Control = control(logf)
+	d.Control = control(logf, netMon)
 	if wrapDialer != nil {
 		return wrapDialer(d)
 	}

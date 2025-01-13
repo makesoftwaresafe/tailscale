@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -41,13 +42,18 @@ import (
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.zx2c4.com/wintun"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
+	"tailscale.com/drive/driveimpl"
 	"tailscale.com/envknob"
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/dns"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tstun"
+	"tailscale.com/tsd"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
+	"tailscale.com/util/osdiag"
+	"tailscale.com/util/syspolicy"
 	"tailscale.com/util/winutil"
 	"tailscale.com/version"
 	"tailscale.com/wf"
@@ -124,14 +130,17 @@ var syslogf logger.Logf = logger.Discard
 // At this point we're still the parent process that
 // Windows started.
 func runWindowsService(pol *logpolicy.Policy) error {
-	if winutil.GetPolicyInteger("LogSCMInteractions", 0) != 0 {
-		syslog, err := eventlog.Open(serviceName)
-		if err == nil {
-			syslogf = func(format string, args ...any) {
+	go func() {
+		logger.Logf(log.Printf).JSON(1, "SupportInfo", osdiag.SupportInfo(osdiag.LogSupportInfoReasonStartup))
+	}()
+
+	if syslog, err := eventlog.Open(serviceName); err == nil {
+		syslogf = func(format string, args ...any) {
+			if logSCMInteractions, _ := syspolicy.GetBoolean(syspolicy.LogSCMInteractions, false); logSCMInteractions {
 				syslog.Info(0, fmt.Sprintf(format, args...))
 			}
-			defer syslog.Close()
 		}
+		defer syslog.Close()
 	}
 
 	syslogf("Service entering svc.Run")
@@ -150,10 +159,7 @@ func (service *ipnService) Execute(args []string, r <-chan svc.ChangeRequest, ch
 	changes <- svc.Status{State: svc.StartPending}
 	syslogf("Service start pending")
 
-	svcAccepts := svc.AcceptStop
-	if winutil.GetPolicyInteger("FlushDNSOnSessionUnlock", 0) != 0 {
-		svcAccepts |= svc.AcceptSessionChange
-	}
+	svcAccepts := svc.AcceptStop | svc.AcceptSessionChange
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -291,8 +297,25 @@ func beWindowsSubprocess() bool {
 		}
 	}()
 
+	// Pre-load wintun.dll using a fully-qualified path so that wintun-go
+	// loads our copy and not some (possibly outdated) copy dropped in system32.
+	// (OSS Issue #10023)
+	fqWintunPath := fullyQualifiedWintunPath(log.Printf)
+	if _, err := windows.LoadDLL(fqWintunPath); err != nil {
+		log.Printf("Error pre-loading \"%s\": %v", fqWintunPath, err)
+	}
+
+	sys := new(tsd.System)
+	netMon, err := netmon.New(log.Printf)
+	if err != nil {
+		log.Fatalf("Could not create netMon: %v", err)
+	}
+	sys.Set(netMon)
+
+	sys.Set(driveimpl.NewFileSystemForRemote(log.Printf))
+
 	publicLogID, _ := logid.ParsePublicID(logID)
-	err := startIPNServer(ctx, log.Printf, publicLogID)
+	err = startIPNServer(ctx, log.Printf, publicLogID, sys)
 	if err != nil {
 		log.Fatalf("ipnserver: %v", err)
 	}
@@ -344,13 +367,15 @@ func handleSessionChange(chgRequest svc.ChangeRequest) {
 		return
 	}
 
-	log.Printf("Received WTS_SESSION_UNLOCK event, initiating DNS flush.")
-	go func() {
-		err := dns.Flush()
-		if err != nil {
-			log.Printf("Error flushing DNS on session unlock: %v", err)
-		}
-	}()
+	if flushDNSOnSessionUnlock, _ := syspolicy.GetBoolean(syspolicy.FlushDNSOnSessionUnlock, false); flushDNSOnSessionUnlock {
+		log.Printf("Received WTS_SESSION_UNLOCK event, initiating DNS flush.")
+		go func() {
+			err := dns.Flush()
+			if err != nil {
+				log.Printf("Error flushing DNS on session unlock: %v", err)
+			}
+		}()
+	}
 }
 
 var (
@@ -408,6 +433,9 @@ func babysitProc(ctx context.Context, args []string, logf logger.Logf) {
 		startTime := time.Now()
 		log.Printf("exec: %#v %v", executable, args)
 		cmd := exec.Command(executable, args...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			CreationFlags: windows.DETACHED_PROCESS,
+		}
 
 		// Create a pipe object to use as the subproc's stdin.
 		// When the writer goes away, the reader gets EOF.
@@ -492,7 +520,7 @@ func babysitProc(ctx context.Context, args []string, logf logger.Logf) {
 }
 
 func uninstallWinTun(logf logger.Logf) {
-	dll := windows.NewLazyDLL("wintun.dll")
+	dll := windows.NewLazyDLL(fullyQualifiedWintunPath(logf))
 	if err := dll.Load(); err != nil {
 		logf("Cannot load wintun.dll for uninstall: %v", err)
 		return
@@ -501,4 +529,16 @@ func uninstallWinTun(logf logger.Logf) {
 	logf("Removing wintun driver...")
 	err := wintun.Uninstall()
 	logf("Uninstall: %v", err)
+}
+
+func fullyQualifiedWintunPath(logf logger.Logf) string {
+	var dir string
+	imgName, err := winutil.ProcessImageName(windows.CurrentProcess())
+	if err != nil {
+		logf("ProcessImageName failed: %v", err)
+	} else {
+		dir = filepath.Dir(imgName)
+	}
+
+	return filepath.Join(dir, "wintun.dll")
 }

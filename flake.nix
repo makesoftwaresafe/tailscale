@@ -40,54 +40,64 @@
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, flake-compat }: let
-    # Grab a helper func out of the Nix language libraries. Annoyingly
-    # these are only accessible through legacyPackages right now,
-    # which forces us to indirect through a platform-specific
-    # path. The x86_64-linux in here doesn't really matter, since all
-    # we're grabbing is a pure Nix string manipulation function that
-    # doesn't build any software.
-    fileContents = nixpkgs.legacyPackages.x86_64-linux.lib.fileContents;
-
+  outputs = {
+    self,
+    nixpkgs,
+    flake-utils,
+    flake-compat,
+  }: let
     # tailscaleRev is the git commit at which this flake was imported,
     # or the empty string when building from a local checkout of the
     # tailscale repo.
-    tailscaleRev = if builtins.hasAttr "rev" self then self.rev else "";
+    tailscaleRev = self.rev or "";
     # tailscale takes a nixpkgs package set, and builds Tailscale from
     # the same commit as this flake. IOW, it provides "tailscale built
     # from HEAD", where HEAD is "whatever commit you imported the
     # flake at".
     #
     # This is currently unfortunately brittle, because we have to
-    # specify vendorSha256, and that sha changes any time we alter
+    # specify vendorHash, and that sha changes any time we alter
     # go.mod. We don't want to force a nix dependency on everyone
     # hacking on Tailscale, so this flake is likely to have broken
     # builds periodically until someone comes through and manually
     # fixes them up. I sure wish there was a way to express "please
-    # just trust the local go.mod, vendorSha256 has no benefit here",
+    # just trust the local go.mod, vendorHash has no benefit here",
     # but alas.
     #
     # So really, this flake is for tailscale devs to dogfood with, if
     # you're an end user you should be prepared for this flake to not
     # build periodically.
-    tailscale = pkgs: pkgs.buildGo120Module rec {
-      name = "tailscale";
+    tailscale = pkgs:
+      pkgs.buildGo123Module rec {
+        name = "tailscale";
 
-      src = ./.;
-      vendorSha256 = fileContents ./go.mod.sri;
-      nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.makeWrapper pkgs.git ];
-      ldflags = ["-X tailscale.com/version.GitCommit=${tailscaleRev}"];
-      CGO_ENABLED = 0;
-      subPackages = [ "cmd/tailscale" "cmd/tailscaled" ];
-      doCheck = false;
-      postInstall = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-        wrapProgram $out/bin/tailscaled --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.iproute2 pkgs.iptables pkgs.getent pkgs.shadow ]}
-        wrapProgram $out/bin/tailscale --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.procps ]}
+        src = ./.;
+        vendorHash = pkgs.lib.fileContents ./go.mod.sri;
+        nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.makeWrapper];
+        ldflags = ["-X tailscale.com/version.gitCommitStamp=${tailscaleRev}"];
+        CGO_ENABLED = 0;
+        subPackages = ["cmd/tailscale" "cmd/tailscaled"];
+        doCheck = false;
 
-        sed -i -e "s#/usr/sbin#$out/bin#" -e "/^EnvironmentFile/d" ./cmd/tailscaled/tailscaled.service
-        install -D -m0444 -t $out/lib/systemd/system ./cmd/tailscaled/tailscaled.service
-      '';
-    };
+        # NOTE: We strip the ${PORT} and $FLAGS because they are unset in the
+        # environment and cause issues (specifically the unset PORT). At some
+        # point, there should be a NixOS module that allows configuration of these
+        # things, but for now, we hardcode the default of port 41641 (taken from
+        # ./cmd/tailscaled/tailscaled.defaults).
+        postInstall = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+          wrapProgram $out/bin/tailscaled --prefix PATH : ${pkgs.lib.makeBinPath [pkgs.iproute2 pkgs.iptables pkgs.getent pkgs.shadow]}
+          wrapProgram $out/bin/tailscale --suffix PATH : ${pkgs.lib.makeBinPath [pkgs.procps]}
+
+          sed -i \
+            -e "s#/usr/sbin#$out/bin#" \
+            -e "/^EnvironmentFile/d" \
+            -e 's/''${PORT}/41641/' \
+            -e 's/$FLAGS//' \
+            ./cmd/tailscaled/tailscaled.service
+
+          install -D -m0444 -t $out/lib/systemd/system ./cmd/tailscaled/tailscaled.service
+        '';
+      };
 
     # This whole blob makes the tailscale package available for all
     # OS/CPU combos that nix supports, as well as a dev shell so that
@@ -97,6 +107,7 @@
       ts = tailscale pkgs;
     in {
       packages = {
+        default = ts;
         tailscale = ts;
       };
       devShell = pkgs.mkShell {
@@ -107,12 +118,16 @@
           gotools
           graphviz
           perl
-          go_1_20
+          go_1_23
           yarn
+
+          # qemu and e2fsprogs are needed for natlab
+          qemu
+          e2fsprogs
         ];
       };
     };
   in
     flake-utils.lib.eachDefaultSystem (system: flakeForSystem nixpkgs system);
 }
-# nix-direnv cache busting line: sha256-MnhCgHrjc2ADJBq162kyy9cSj0uVMq3eyu22qoxWgpE=
+# nix-direnv cache busting line: sha256-xO1DuLWi6/lpA9ubA2ZYVJM+CkVNA5IaVGZxX9my0j0=

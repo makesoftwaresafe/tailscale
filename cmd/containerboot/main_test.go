@@ -31,6 +31,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/sys/unix"
 	"tailscale.com/ipn"
+	"tailscale.com/kube/egressservices"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/types/netmap"
@@ -52,6 +53,22 @@ func TestContainerBoot(t *testing.T) {
 	}
 	defer kube.Close()
 
+	tailscaledConf := &ipn.ConfigVAlpha{AuthKey: ptr.To("foo"), Version: "alpha0"}
+	tailscaledConfBytes, err := json.Marshal(tailscaledConf)
+	if err != nil {
+		t.Fatalf("error unmarshaling tailscaled config: %v", err)
+	}
+	serveConf := ipn.ServeConfig{TCP: map[uint16]*ipn.TCPPortHandler{80: {HTTP: true}}}
+	serveConfBytes, err := json.Marshal(serveConf)
+	if err != nil {
+		t.Fatalf("error unmarshaling serve config: %v", err)
+	}
+	egressSvcsCfg := egressservices.Configs{"foo": {TailnetTarget: egressservices.TailnetTarget{FQDN: "foo.tailnetxyx.ts.net"}}}
+	egressSvcsCfgBytes, err := json.Marshal(egressSvcsCfg)
+	if err != nil {
+		t.Fatalf("error unmarshaling egress services config: %v", err)
+	}
+
 	dirs := []string{
 		"var/lib",
 		"usr/bin",
@@ -59,6 +76,7 @@ func TestContainerBoot(t *testing.T) {
 		"dev/net",
 		"proc/sys/net/ipv4",
 		"proc/sys/net/ipv6/conf/all",
+		"etc/tailscaled",
 	}
 	for _, path := range dirs {
 		if err := os.MkdirAll(filepath.Join(d, path), 0700); err != nil {
@@ -66,13 +84,16 @@ func TestContainerBoot(t *testing.T) {
 		}
 	}
 	files := map[string][]byte{
-		"usr/bin/tailscaled":                    fakeTailscaled,
-		"usr/bin/tailscale":                     fakeTailscale,
-		"usr/bin/iptables":                      fakeTailscale,
-		"usr/bin/ip6tables":                     fakeTailscale,
-		"dev/net/tun":                           []byte(""),
-		"proc/sys/net/ipv4/ip_forward":          []byte("0"),
-		"proc/sys/net/ipv6/conf/all/forwarding": []byte("0"),
+		"usr/bin/tailscaled":                         fakeTailscaled,
+		"usr/bin/tailscale":                          fakeTailscale,
+		"usr/bin/iptables":                           fakeTailscale,
+		"usr/bin/ip6tables":                          fakeTailscale,
+		"dev/net/tun":                                []byte(""),
+		"proc/sys/net/ipv4/ip_forward":               []byte("0"),
+		"proc/sys/net/ipv6/conf/all/forwarding":      []byte("0"),
+		"etc/tailscaled/cap-95.hujson":               tailscaledConfBytes,
+		"etc/tailscaled/serve-config.json":           serveConfBytes,
+		"etc/tailscaled/egress-services-config.json": egressSvcsCfgBytes,
 	}
 	resetFiles := func() {
 		for path, content := range files {
@@ -93,6 +114,26 @@ func TestContainerBoot(t *testing.T) {
 
 	argFile := filepath.Join(d, "args")
 	runningSockPath := filepath.Join(d, "tmp/tailscaled.sock")
+	var localAddrPort, healthAddrPort int
+	for _, p := range []*int{&localAddrPort, &healthAddrPort} {
+		ln, err := net.Listen("tcp", ":0")
+		if err != nil {
+			t.Fatalf("Failed to open listener: %v", err)
+		}
+		if err := ln.Close(); err != nil {
+			t.Fatalf("Failed to close listener: %v", err)
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		*p = port
+	}
+	metricsURL := func(port int) string {
+		return fmt.Sprintf("http://127.0.0.1:%d/metrics", port)
+	}
+	healthURL := func(port int) string {
+		return fmt.Sprintf("http://127.0.0.1:%d/healthz", port)
+	}
+
+	capver := fmt.Sprintf("%d", tailcfg.CurrentCapabilityVersion)
 
 	type phase struct {
 		// If non-nil, send this IPN bus notification (and remember it as the
@@ -108,15 +149,20 @@ func TestContainerBoot(t *testing.T) {
 		// WantFiles files that should exist in the container and their
 		// contents.
 		WantFiles map[string]string
+		// WantFatalLog is the fatal log message we expect from containerboot.
+		// If set for a phase, the test will finish on that phase.
+		WantFatalLog string
+
+		EndpointStatuses map[string]int
 	}
 	runningNotify := &ipn.Notify{
 		State: ptr.To(ipn.Running),
 		NetMap: &netmap.NetworkMap{
-			SelfNode: &tailcfg.Node{
-				StableID: tailcfg.StableNodeID("myID"),
-				Name:     "test-node.test.ts.net",
-			},
-			Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+			SelfNode: (&tailcfg.Node{
+				StableID:  tailcfg.StableNodeID("myID"),
+				Name:      "test-node.test.ts.net",
+				Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+			}).View(),
 		},
 	}
 	tests := []struct {
@@ -135,6 +181,11 @@ func TestContainerBoot(t *testing.T) {
 					WantCmds: []string{
 						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
 						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false",
+					},
+					// No metrics or health by default.
+					EndpointStatuses: map[string]int{
+						metricsURL(9002): -1,
+						healthURL(9002):  -1,
 					},
 				},
 				{
@@ -219,6 +270,28 @@ func TestContainerBoot(t *testing.T) {
 			},
 		},
 		{
+			Name: "empty routes",
+			Env: map[string]string{
+				"TS_AUTHKEY": "tskey-key",
+				"TS_ROUTES":  "",
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key --advertise-routes=",
+					},
+				},
+				{
+					Notify: runningNotify,
+					WantFiles: map[string]string{
+						"proc/sys/net/ipv4/ip_forward":          "0",
+						"proc/sys/net/ipv6/conf/all/forwarding": "0",
+					},
+				},
+			},
+		},
+		{
 			Name: "routes_kernel_ipv4",
 			Env: map[string]string{
 				"TS_AUTHKEY":   "tskey-key",
@@ -288,7 +361,7 @@ func TestContainerBoot(t *testing.T) {
 			},
 		},
 		{
-			Name: "proxy",
+			Name: "ingress proxy",
 			Env: map[string]string{
 				"TS_AUTHKEY":   "tskey-key",
 				"TS_DEST_IP":   "1.2.3.4",
@@ -303,9 +376,70 @@ func TestContainerBoot(t *testing.T) {
 				},
 				{
 					Notify: runningNotify,
+				},
+			},
+		},
+		{
+			Name: "egress proxy",
+			Env: map[string]string{
+				"TS_AUTHKEY":           "tskey-key",
+				"TS_TAILNET_TARGET_IP": "100.99.99.99",
+				"TS_USERSPACE":         "false",
+			},
+			Phases: []phase{
+				{
 					WantCmds: []string{
-						"/usr/bin/iptables -t nat -I PREROUTING 1 -d 100.64.0.1 -j DNAT --to-destination 1.2.3.4",
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
 					},
+					WantFiles: map[string]string{
+						"proc/sys/net/ipv4/ip_forward":          "1",
+						"proc/sys/net/ipv6/conf/all/forwarding": "0",
+					},
+				},
+				{
+					Notify: runningNotify,
+				},
+			},
+		},
+		{
+			Name: "egress_proxy_fqdn_ipv6_target_on_ipv4_host",
+			Env: map[string]string{
+				"TS_AUTHKEY":               "tskey-key",
+				"TS_TAILNET_TARGET_FQDN":   "ipv6-node.test.ts.net", // resolves to IPv6 address
+				"TS_USERSPACE":             "false",
+				"TS_TEST_FAKE_NETFILTER_6": "false",
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
+					},
+					WantFiles: map[string]string{
+						"proc/sys/net/ipv4/ip_forward":          "1",
+						"proc/sys/net/ipv6/conf/all/forwarding": "0",
+					},
+				},
+				{
+					Notify: &ipn.Notify{
+						State: ptr.To(ipn.Running),
+						NetMap: &netmap.NetworkMap{
+							SelfNode: (&tailcfg.Node{
+								StableID:  tailcfg.StableNodeID("myID"),
+								Name:      "test-node.test.ts.net",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							}).View(),
+							Peers: []tailcfg.NodeView{
+								(&tailcfg.Node{
+									StableID:  tailcfg.StableNodeID("ipv6ID"),
+									Name:      "ipv6-node.test.ts.net",
+									Addresses: []netip.Prefix{netip.MustParsePrefix("::1/128")},
+								}).View(),
+							},
+						},
+					},
+					WantFatalLog: "no forwarding rules for egress addresses [::1/128], host supports IPv6: false",
 				},
 			},
 		},
@@ -331,6 +465,9 @@ func TestContainerBoot(t *testing.T) {
 				},
 				{
 					Notify: runningNotify,
+					WantCmds: []string{
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock set --accept-dns=false",
+					},
 				},
 			},
 		},
@@ -356,9 +493,11 @@ func TestContainerBoot(t *testing.T) {
 				{
 					Notify: runningNotify,
 					WantKubeSecret: map[string]string{
-						"authkey":     "tskey-key",
-						"device_fqdn": "test-node.test.ts.net",
-						"device_id":   "myID",
+						"authkey":          "tskey-key",
+						"device_fqdn":      "test-node.test.ts.net",
+						"device_id":        "myID",
+						"device_ips":       `["100.64.0.1"]`,
+						"tailscale_capver": capver,
 					},
 				},
 			},
@@ -444,9 +583,14 @@ func TestContainerBoot(t *testing.T) {
 				},
 				{
 					Notify: runningNotify,
+					WantCmds: []string{
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock set --accept-dns=false",
+					},
 					WantKubeSecret: map[string]string{
-						"device_fqdn": "test-node.test.ts.net",
-						"device_id":   "myID",
+						"device_fqdn":      "test-node.test.ts.net",
+						"device_id":        "myID",
+						"device_ips":       `["100.64.0.1"]`,
+						"tailscale_capver": capver,
 					},
 				},
 			},
@@ -473,26 +617,30 @@ func TestContainerBoot(t *testing.T) {
 				{
 					Notify: runningNotify,
 					WantKubeSecret: map[string]string{
-						"authkey":     "tskey-key",
-						"device_fqdn": "test-node.test.ts.net",
-						"device_id":   "myID",
+						"authkey":          "tskey-key",
+						"device_fqdn":      "test-node.test.ts.net",
+						"device_id":        "myID",
+						"device_ips":       `["100.64.0.1"]`,
+						"tailscale_capver": capver,
 					},
 				},
 				{
 					Notify: &ipn.Notify{
 						State: ptr.To(ipn.Running),
 						NetMap: &netmap.NetworkMap{
-							SelfNode: &tailcfg.Node{
-								StableID: tailcfg.StableNodeID("newID"),
-								Name:     "new-name.test.ts.net",
-							},
-							Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							SelfNode: (&tailcfg.Node{
+								StableID:  tailcfg.StableNodeID("newID"),
+								Name:      "new-name.test.ts.net",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							}).View(),
 						},
 					},
 					WantKubeSecret: map[string]string{
-						"authkey":     "tskey-key",
-						"device_fqdn": "new-name.test.ts.net",
-						"device_id":   "newID",
+						"authkey":          "tskey-key",
+						"device_fqdn":      "new-name.test.ts.net",
+						"device_id":        "newID",
+						"device_ips":       `["100.64.0.1"]`,
+						"tailscale_capver": capver,
 					},
 				},
 			},
@@ -550,6 +698,22 @@ func TestContainerBoot(t *testing.T) {
 			},
 		},
 		{
+			Name: "extra_args_accept_routes",
+			Env: map[string]string{
+				"TS_EXTRA_ARGS": "--accept-routes",
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --accept-routes",
+					},
+				}, {
+					Notify: runningNotify,
+				},
+			},
+		},
+		{
 			Name: "hostname",
 			Env: map[string]string{
 				"TS_HOSTNAME": "my-server",
@@ -562,6 +726,214 @@ func TestContainerBoot(t *testing.T) {
 					},
 				}, {
 					Notify: runningNotify,
+				},
+			},
+		},
+		{
+			Name: "experimental tailscaled config path",
+			Env: map[string]string{
+				"TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR": filepath.Join(d, "etc/tailscaled/"),
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking --config=/etc/tailscaled/cap-95.hujson",
+					},
+				}, {
+					Notify: runningNotify,
+				},
+			},
+		},
+		{
+			Name: "metrics_enabled",
+			Env: map[string]string{
+				"TS_LOCAL_ADDR_PORT": fmt.Sprintf("[::]:%d", localAddrPort),
+				"TS_ENABLE_METRICS":  "true",
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false",
+					},
+					EndpointStatuses: map[string]int{
+						metricsURL(localAddrPort): 200,
+						healthURL(localAddrPort):  -1,
+					},
+				}, {
+					Notify: runningNotify,
+				},
+			},
+		},
+		{
+			Name: "health_enabled",
+			Env: map[string]string{
+				"TS_LOCAL_ADDR_PORT":     fmt.Sprintf("[::]:%d", localAddrPort),
+				"TS_ENABLE_HEALTH_CHECK": "true",
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false",
+					},
+					EndpointStatuses: map[string]int{
+						metricsURL(localAddrPort): -1,
+						healthURL(localAddrPort):  503, // Doesn't start passing until the next phase.
+					},
+				}, {
+					Notify: runningNotify,
+					EndpointStatuses: map[string]int{
+						metricsURL(localAddrPort): -1,
+						healthURL(localAddrPort):  200,
+					},
+				},
+			},
+		},
+		{
+			Name: "metrics_and_health_on_same_port",
+			Env: map[string]string{
+				"TS_LOCAL_ADDR_PORT":     fmt.Sprintf("[::]:%d", localAddrPort),
+				"TS_ENABLE_METRICS":      "true",
+				"TS_ENABLE_HEALTH_CHECK": "true",
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false",
+					},
+					EndpointStatuses: map[string]int{
+						metricsURL(localAddrPort): 200,
+						healthURL(localAddrPort):  503, // Doesn't start passing until the next phase.
+					},
+				}, {
+					Notify: runningNotify,
+					EndpointStatuses: map[string]int{
+						metricsURL(localAddrPort): 200,
+						healthURL(localAddrPort):  200,
+					},
+				},
+			},
+		},
+		{
+			Name: "local_metrics_and_deprecated_health",
+			Env: map[string]string{
+				"TS_LOCAL_ADDR_PORT":       fmt.Sprintf("[::]:%d", localAddrPort),
+				"TS_ENABLE_METRICS":        "true",
+				"TS_HEALTHCHECK_ADDR_PORT": fmt.Sprintf("[::]:%d", healthAddrPort),
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false",
+					},
+					EndpointStatuses: map[string]int{
+						metricsURL(localAddrPort): 200,
+						healthURL(healthAddrPort): 503, // Doesn't start passing until the next phase.
+					},
+				}, {
+					Notify: runningNotify,
+					EndpointStatuses: map[string]int{
+						metricsURL(localAddrPort): 200,
+						healthURL(healthAddrPort): 200,
+					},
+				},
+			},
+		},
+		{
+			Name: "serve_config_no_kube",
+			Env: map[string]string{
+				"TS_SERVE_CONFIG": filepath.Join(d, "etc/tailscaled/serve-config.json"),
+				"TS_AUTHKEY":      "tskey-key",
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
+					},
+				},
+				{
+					Notify: runningNotify,
+				},
+			},
+		},
+		{
+			Name: "serve_config_kube",
+			Env: map[string]string{
+				"KUBERNETES_SERVICE_HOST":       kube.Host,
+				"KUBERNETES_SERVICE_PORT_HTTPS": kube.Port,
+				"TS_SERVE_CONFIG":               filepath.Join(d, "etc/tailscaled/serve-config.json"),
+			},
+			KubeSecret: map[string]string{
+				"authkey": "tskey-key",
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=kube:tailscale --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
+					},
+					WantKubeSecret: map[string]string{
+						"authkey": "tskey-key",
+					},
+				},
+				{
+					Notify: runningNotify,
+					WantKubeSecret: map[string]string{
+						"authkey":          "tskey-key",
+						"device_fqdn":      "test-node.test.ts.net",
+						"device_id":        "myID",
+						"device_ips":       `["100.64.0.1"]`,
+						"https_endpoint":   "no-https",
+						"tailscale_capver": capver,
+					},
+				},
+			},
+		},
+		{
+			Name: "egress_svcs_config_kube",
+			Env: map[string]string{
+				"KUBERNETES_SERVICE_HOST":        kube.Host,
+				"KUBERNETES_SERVICE_PORT_HTTPS":  kube.Port,
+				"TS_EGRESS_SERVICES_CONFIG_PATH": filepath.Join(d, "etc/tailscaled/egress-services-config.json"),
+			},
+			KubeSecret: map[string]string{
+				"authkey": "tskey-key",
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=kube:tailscale --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
+					},
+					WantKubeSecret: map[string]string{
+						"authkey": "tskey-key",
+					},
+				},
+				{
+					Notify: runningNotify,
+					WantKubeSecret: map[string]string{
+						"authkey":          "tskey-key",
+						"device_fqdn":      "test-node.test.ts.net",
+						"device_id":        "myID",
+						"device_ips":       `["100.64.0.1"]`,
+						"tailscale_capver": capver,
+					},
+				},
+			},
+		},
+		{
+			Name: "egress_svcs_config_no_kube",
+			Env: map[string]string{
+				"TS_EGRESS_SERVICES_CONFIG_PATH": filepath.Join(d, "etc/tailscaled/egress-services-config.json"),
+				"TS_AUTHKEY":                     "tskey-key",
+			},
+			Phases: []phase{
+				{
+					WantFatalLog: "TS_EGRESS_SERVICES_CONFIG_PATH is only supported for Tailscale running on Kubernetes",
 				},
 			},
 		},
@@ -587,6 +959,7 @@ func TestContainerBoot(t *testing.T) {
 				fmt.Sprintf("TS_TEST_SOCKET=%s", lapi.Path),
 				fmt.Sprintf("TS_SOCKET=%s", runningSockPath),
 				fmt.Sprintf("TS_TEST_ONLY_ROOT=%s", d),
+				fmt.Sprint("TS_TEST_FAKE_NETFILTER=true"),
 			}
 			for k, v := range test.Env {
 				cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
@@ -609,6 +982,25 @@ func TestContainerBoot(t *testing.T) {
 			var wantCmds []string
 			for i, p := range test.Phases {
 				lapi.Notify(p.Notify)
+				if p.WantFatalLog != "" {
+					err := tstest.WaitFor(2*time.Second, func() error {
+						state, err := cmd.Process.Wait()
+						if err != nil {
+							return err
+						}
+						if state.ExitCode() != 1 {
+							return fmt.Errorf("process exited with code %d but wanted %d", state.ExitCode(), 1)
+						}
+						waitLogLine(t, time.Second, cbOut, p.WantFatalLog)
+						return nil
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					// Early test return, we don't expect the successful startup log message.
+					return
+				}
 				wantCmds = append(wantCmds, p.WantCmds...)
 				waitArgs(t, 2*time.Second, d, argFile, strings.Join(wantCmds, "\n"))
 				err := tstest.WaitFor(2*time.Second, func() error {
@@ -641,7 +1033,26 @@ func TestContainerBoot(t *testing.T) {
 					return nil
 				})
 				if err != nil {
-					t.Fatal(err)
+					t.Fatalf("phase %d: %v", i, err)
+				}
+
+				for url, want := range p.EndpointStatuses {
+					err := tstest.WaitFor(2*time.Second, func() error {
+						resp, err := http.Get(url)
+						if err != nil && want != -1 {
+							return fmt.Errorf("GET %s: %v", url, err)
+						}
+						if want > 0 && resp.StatusCode != want {
+							defer resp.Body.Close()
+							body, _ := io.ReadAll(resp.Body)
+							return fmt.Errorf("GET %s, want %d, got %d\n%s", url, want, resp.StatusCode, string(body))
+						}
+
+						return nil
+					})
+					if err != nil {
+						t.Fatalf("phase %d: %v", i, err)
+					}
 				}
 			}
 			waitLogLine(t, 2*time.Second, cbOut, "Startup complete, waiting for shutdown signal")
@@ -790,10 +1201,23 @@ func (l *localAPI) Notify(n *ipn.Notify) {
 }
 
 func (l *localAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		panic(fmt.Sprintf("unsupported method %q", r.Method))
-	}
-	if r.URL.Path != "/localapi/v0/watch-ipn-bus" {
+	switch r.URL.Path {
+	case "/localapi/v0/serve-config":
+		if r.Method != "POST" {
+			panic(fmt.Sprintf("unsupported method %q", r.Method))
+		}
+		return
+	case "/localapi/v0/watch-ipn-bus":
+		if r.Method != "GET" {
+			panic(fmt.Sprintf("unsupported method %q", r.Method))
+		}
+	case "/localapi/v0/usermetrics":
+		if r.Method != "GET" {
+			panic(fmt.Sprintf("unsupported method %q", r.Method))
+		}
+		w.Write([]byte("fake metrics"))
+		return
+	default:
 		panic(fmt.Sprintf("unsupported path %q", r.URL.Path))
 	}
 
@@ -949,9 +1373,6 @@ func (k *kubeServer) serveSecret(w http.ResponseWriter, r *http.Request) {
 		defer k.Unlock()
 		for k, v := range k.secret {
 			v := base64.StdEncoding.EncodeToString([]byte(v))
-			if err != nil {
-				panic("encode failed")
-			}
 			ret["data"][k] = v
 		}
 		if err := json.NewEncoder(w).Encode(ret); err != nil {

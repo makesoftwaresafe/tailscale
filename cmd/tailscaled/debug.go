@@ -21,12 +21,12 @@ import (
 	"time"
 
 	"tailscale.com/derp/derphttp"
+	"tailscale.com/health"
 	"tailscale.com/ipn"
-	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
-	"tailscale.com/wgengine/monitor"
 )
 
 var debugArgs struct {
@@ -42,7 +42,7 @@ var debugModeFunc = debugMode // so it can be addressable
 func debugMode(args []string) error {
 	fs := flag.NewFlagSet("debug", flag.ExitOnError)
 	fs.BoolVar(&debugArgs.ifconfig, "ifconfig", false, "If true, print network interface state")
-	fs.BoolVar(&debugArgs.monitor, "monitor", false, "If true, run link monitor forever. Precludes all other options.")
+	fs.BoolVar(&debugArgs.monitor, "monitor", false, "If true, run network monitor forever. Precludes all other options.")
 	fs.BoolVar(&debugArgs.portmap, "portmap", false, "If true, run portmap debugging. Precludes all other options.")
 	fs.StringVar(&debugArgs.getURL, "get-url", "", "If non-empty, fetch provided URL.")
 	fs.StringVar(&debugArgs.derpCheck, "derp", "", "if non-empty, test a DERP ping via named region code")
@@ -72,23 +72,23 @@ func debugMode(args []string) error {
 }
 
 func runMonitor(ctx context.Context, loop bool) error {
-	dump := func(st *interfaces.State) {
+	dump := func(st *netmon.State) {
 		j, _ := json.MarshalIndent(st, "", "    ")
 		os.Stderr.Write(j)
 	}
-	mon, err := monitor.New(log.Printf)
+	mon, err := netmon.New(log.Printf)
 	if err != nil {
 		return err
 	}
 	defer mon.Close()
 
-	mon.RegisterChangeCallback(func(changed bool, st *interfaces.State) {
-		if !changed {
-			log.Printf("Link monitor fired; no change")
+	mon.RegisterChangeCallback(func(delta *netmon.ChangeDelta) {
+		if !delta.Major {
+			log.Printf("Network monitor fired; not a major change")
 			return
 		}
-		log.Printf("Link monitor fired. New state:")
-		dump(st)
+		log.Printf("Network monitor fired. New state:")
+		dump(delta.New)
 	})
 	if loop {
 		log.Printf("Starting link change monitor; initial state:")
@@ -157,6 +157,7 @@ func getURL(ctx context.Context, urlStr string) error {
 }
 
 func checkDerp(ctx context.Context, derpRegion string) (err error) {
+	ht := new(health.Tracker)
 	req, err := http.NewRequestWithContext(ctx, "GET", ipn.DefaultControlURL+"/derpmap/default", nil)
 	if err != nil {
 		return fmt.Errorf("create derp map request: %w", err)
@@ -193,8 +194,10 @@ func checkDerp(ctx context.Context, derpRegion string) (err error) {
 	priv1 := key.NewNode()
 	priv2 := key.NewNode()
 
-	c1 := derphttp.NewRegionClient(priv1, log.Printf, getRegion)
-	c2 := derphttp.NewRegionClient(priv2, log.Printf, getRegion)
+	c1 := derphttp.NewRegionClient(priv1, log.Printf, nil, getRegion)
+	c2 := derphttp.NewRegionClient(priv2, log.Printf, nil, getRegion)
+	c1.HealthTracker = ht
+	c2.HealthTracker = ht
 	defer func() {
 		if err != nil {
 			c1.Close()

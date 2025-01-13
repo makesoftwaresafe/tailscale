@@ -8,12 +8,15 @@ import (
 	"strings"
 	"time"
 
+	"tailscale.com/drive"
+	"tailscale.com/health"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/empty"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/structs"
+	"tailscale.com/types/views"
 )
 
 type State int
@@ -55,17 +58,29 @@ type EngineStatus struct {
 // to subscribe to.
 type NotifyWatchOpt uint64
 
+// NotifyWatchOpt values.
+//
+// These aren't declared using Go's iota because they're not purely internal to
+// the process and iota should not be used for values that are serialized to
+// disk or network. In this case, these values come over the network via the
+// LocalAPI, a mostly stable API.
 const (
 	// NotifyWatchEngineUpdates, if set, causes Engine updates to be sent to the
 	// client either regularly or when they change, without having to ask for
-	// each one via RequestEngineStatus.
-	NotifyWatchEngineUpdates NotifyWatchOpt = 1 << iota
+	// each one via Engine.RequestStatus.
+	NotifyWatchEngineUpdates NotifyWatchOpt = 1 << 0
 
-	NotifyInitialState  // if set, the first Notify message (sent immediately) will contain the current State + BrowseToURL
-	NotifyInitialPrefs  // if set, the first Notify message (sent immediately) will contain the current Prefs
-	NotifyInitialNetMap // if set, the first Notify message (sent immediately) will contain the current NetMap
+	NotifyInitialState  NotifyWatchOpt = 1 << 1 // if set, the first Notify message (sent immediately) will contain the current State + BrowseToURL + SessionID
+	NotifyInitialPrefs  NotifyWatchOpt = 1 << 2 // if set, the first Notify message (sent immediately) will contain the current Prefs
+	NotifyInitialNetMap NotifyWatchOpt = 1 << 3 // if set, the first Notify message (sent immediately) will contain the current NetMap
 
-	NotifyNoPrivateKeys // if set, private keys that would normally be sent in updates are zeroed out
+	NotifyNoPrivateKeys        NotifyWatchOpt = 1 << 4 // if set, private keys that would normally be sent in updates are zeroed out
+	NotifyInitialDriveShares   NotifyWatchOpt = 1 << 5 // if set, the first Notify message (sent immediately) will contain the current Taildrive Shares
+	NotifyInitialOutgoingFiles NotifyWatchOpt = 1 << 6 // if set, the first Notify message (sent immediately) will contain the current Taildrop OutgoingFiles
+
+	NotifyInitialHealthState NotifyWatchOpt = 1 << 7 // if set, the first Notify message (sent immediately) will contain the current health.State of the client
+
+	NotifyRateLimit NotifyWatchOpt = 1 << 8 // if set, rate limit spammy netmap updates to every few seconds
 )
 
 // Notify is a communication from a backend (e.g. tailscaled) to a frontend
@@ -77,6 +92,12 @@ type Notify struct {
 	_       structs.Incomparable
 	Version string // version number of IPN backend
 
+	// SessionID identifies the unique WatchIPNBus session.
+	// This field is only set in the first message when requesting
+	// NotifyInitialState. Clients must store it on their side as
+	// following notifications will not include this field.
+	SessionID string `json:",omitempty"`
+
 	// ErrMessage, if non-nil, contains a critical error message.
 	// For State InUseOtherUser, ErrMessage is not critical and just contains the details.
 	ErrMessage *string
@@ -87,7 +108,6 @@ type Notify struct {
 	NetMap        *netmap.NetworkMap // if non-nil, the new or current netmap
 	Engine        *EngineStatus      // if non-nil, the new or current wireguard stats
 	BrowseToURL   *string            // if non-nil, UI should open a browser right now
-	BackendLogID  *string            // if non-nil, the public logtail ID used by backend
 
 	// FilesWaiting if non-nil means that files are buffered in
 	// the Tailscale daemon and ready for local transfer to the
@@ -105,6 +125,11 @@ type Notify struct {
 	// Deprecated: use LocalClient.AwaitWaitingFiles instead.
 	IncomingFiles []PartialFile `json:",omitempty"`
 
+	// OutgoingFiles, if non-nil, tracks which files are in the process of
+	// being sent via TailDrop, including files that finished, whether
+	// successful or failed. This slice is sorted by Started time, then Name.
+	OutgoingFiles []*OutgoingFile `json:",omitempty"`
+
 	// LocalTCPPort, if non-nil, informs the UI frontend which
 	// (non-zero) localhost TCP port it's listening on.
 	// This is currently only used by Tailscale when run in the
@@ -115,7 +140,20 @@ type Notify struct {
 	// is available.
 	ClientVersion *tailcfg.ClientVersion `json:",omitempty"`
 
-	// type is mirrored in xcode/Shared/IPN.swift
+	// DriveShares tracks the full set of current DriveShares that we're
+	// publishing. Some client applications, like the MacOS and Windows clients,
+	// will listen for updates to this and handle serving these shares under
+	// the identity of the unprivileged user that is running the application. A
+	// nil value here means that we're not broadcasting shares information, an
+	// empty value means that there are no shares.
+	DriveShares views.SliceView[*drive.Share, drive.ShareView]
+
+	// Health is the last-known health state of the backend. When this field is
+	// non-nil, a change in health verified, and the API client should surface
+	// any changes to the user in the UI.
+	Health *health.State `json:",omitempty"`
+
+	// type is mirrored in xcode/IPN/Core/LocalAPI/Model/LocalAPIModel.swift
 }
 
 func (n Notify) String() string {
@@ -142,9 +180,6 @@ func (n Notify) String() string {
 	if n.BrowseToURL != nil {
 		sb.WriteString("URL=<...> ")
 	}
-	if n.BackendLogID != nil {
-		sb.WriteString("BackendLogID ")
-	}
 	if n.FilesWaiting != nil {
 		sb.WriteString("FilesWaiting ")
 	}
@@ -154,11 +189,14 @@ func (n Notify) String() string {
 	if n.LocalTCPPort != nil {
 		fmt.Fprintf(&sb, "tcpport=%v ", n.LocalTCPPort)
 	}
+	if n.Health != nil {
+		sb.WriteString("Health{...} ")
+	}
 	s := sb.String()
 	return s[0:len(s)-1] + "}"
 }
 
-// PartialFile represents an in-progress file transfer.
+// PartialFile represents an in-progress incoming file transfer.
 type PartialFile struct {
 	Name         string    // e.g. "foo.jpg"
 	Started      time.Time // time transfer started
@@ -169,11 +207,24 @@ type PartialFile struct {
 	// in-progress '*.partial' file's path when the peerapi isn't
 	// being used; see LocalBackend.SetDirectFileRoot.
 	PartialPath string `json:",omitempty"`
+	FinalPath   string `json:",omitempty"`
 
 	// Done is set in "direct" mode when the partial file has been
 	// closed and is ready for the caller to rename away the
 	// ".partial" suffix.
 	Done bool `json:",omitempty"`
+}
+
+// OutgoingFile represents an in-progress outgoing file transfer.
+type OutgoingFile struct {
+	ID           string               `json:",omitempty"` // unique identifier for this transfer (a type 4 UUID)
+	PeerID       tailcfg.StableNodeID `json:",omitempty"` // identifier for the peer to which this is being transferred
+	Name         string               `json:",omitempty"` // e.g. "foo.jpg"
+	Started      time.Time            // time transfer started
+	DeclaredSize int64                // or -1 if unknown
+	Sent         int64                // bytes copied thus far
+	Finished     bool                 // indicates whether or not the transfer finished
+	Succeeded    bool                 // for a finished transfer, indicates whether or not it was successful
 }
 
 // StateKey is an opaque identifier for a set of LocalBackend state
@@ -186,21 +237,22 @@ type PartialFile struct {
 //   - "_debug_<component>_until" with value being a unix timestamp stringified
 type StateKey string
 
+// DebuggableComponents is a list of components whose debugging can be turned on
+// and off individually using the tailscale debug command.
+var DebuggableComponents = []string{
+	"magicsock",
+	"sockstats",
+	"syspolicy",
+}
+
 type Options struct {
 	// FrontendLogID is the public logtail id used by the frontend.
 	FrontendLogID string
-	// LegacyMigrationPrefs are used to migrate preferences from the
-	// frontend to the backend.
-	// If non-nil, they are imported as a new profile.
-	LegacyMigrationPrefs *Prefs `json:"Prefs"`
-	// UpdatePrefs, if provided, overrides Options.LegacyMigrationPrefs
-	// *and* the Prefs already stored in the backend state, *except* for
-	// the Persist member. If you just want to provide prefs, this is
-	// probably what you want.
+	// UpdatePrefs, if provided, overrides the Prefs already stored in the
+	// backend state, *except* for the Persist member.
 	//
 	// TODO(apenwarr): Rename this to Prefs, and possibly move Prefs.Persist
-	//   elsewhere entirely (as it always should have been). Or, move the
-	//   fancy state migration stuff out of Start().
+	// elsewhere entirely (as it always should have been).
 	UpdatePrefs *Prefs
 	// AuthKey is an optional node auth key used to authorize a
 	// new node key without user interaction.

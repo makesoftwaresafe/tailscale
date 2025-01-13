@@ -14,7 +14,10 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"tailscale.com/control/controlknobs"
 	"tailscale.com/net/netaddr"
+	"tailscale.com/net/netmon"
+	"tailscale.com/syncs"
 	"tailscale.com/types/logger"
 )
 
@@ -24,6 +27,7 @@ type TestIGD struct {
 	upnpConn net.PacketConn // for UPnP discovery
 	pxpConn  net.PacketConn // for NAT-PMP and/or PCP
 	ts       *httptest.Server
+	upnpHTTP syncs.AtomicValue[http.Handler]
 	logf     logger.Logf
 	closed   atomic.Bool
 
@@ -47,9 +51,7 @@ type TestIGDOptions struct {
 type igdCounters struct {
 	numUPnPDiscoRecv     int32
 	numUPnPOtherUDPRecv  int32
-	numUPnPHTTPRecv      int32
 	numPMPRecv           int32
-	numPMPDiscoRecv      int32
 	numPCPRecv           int32
 	numPCPDiscoRecv      int32
 	numPCPMapRecv        int32
@@ -125,8 +127,17 @@ func (d *TestIGD) stats() igdCounters {
 	return d.counters
 }
 
+func (d *TestIGD) SetUPnPHandler(h http.Handler) {
+	d.upnpHTTP.Store(h)
+}
+
 func (d *TestIGD) serveUPnPHTTP(w http.ResponseWriter, r *http.Request) {
-	http.NotFound(w, r) // TODO
+	if handler := d.upnpHTTP.Load(); handler != nil {
+		handler.ServeHTTP(w, r)
+		return
+	}
+
+	http.NotFound(w, r)
 }
 
 func (d *TestIGD) serveUPnPDiscovery() {
@@ -249,12 +260,13 @@ func (d *TestIGD) handlePCPQuery(pkt []byte, src netip.AddrPort) {
 
 func newTestClient(t *testing.T, igd *TestIGD) *Client {
 	var c *Client
-	c = NewClient(t.Logf, nil, func() {
+	c = NewClient(t.Logf, netmon.NewStatic(), nil, new(controlknobs.Knobs), func() {
 		t.Logf("port map changed")
 		t.Logf("have mapping: %v", c.HaveMapping())
 	})
 	c.testPxPPort = igd.TestPxPPort()
 	c.testUPnPPort = igd.TestUPnPPort()
+	c.netMon = netmon.NewStatic()
 	c.SetGatewayLookupFunc(testIPAndGateway)
 	return c
 }

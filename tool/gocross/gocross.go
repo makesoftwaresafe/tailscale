@@ -8,7 +8,6 @@
 // In short, when aliased to `go`, using `go build`, `go test` behave like the
 // upstream Go tools, but produce correctly configured, correctly linked
 // binaries stamped with version information.
-
 package main
 
 import (
@@ -104,7 +103,7 @@ func main() {
 //go:embed gocross-wrapper.sh
 var wrapperScript []byte
 
-func debug(format string, args ...interface{}) {
+func debug(format string, args ...any) {
 	debug := os.Getenv("GOCROSS_DEBUG")
 	var (
 		out *os.File

@@ -9,6 +9,7 @@
 
 cmd/tailscale/tailscale
 cmd/tailscaled/tailscaled
+ssh/tailssh/testcontainers/tailscaled
 
 # Test binary, built with `go test -c`
 *.test
@@ -35,5 +36,16 @@ cmd/tailscaled/tailscaled
 # Ignore direnv nix-shell environment cache
 .direnv/
 
+# Ignore web client node modules
+.vite/
+client/web/node_modules
+client/web/build/assets
+
 /gocross
 /dist
+
+# Ignore xcode userstate and workspace data
+*.xcuserstate
+*.xcworkspacedata
+/tstest/tailmac/bin
+/tstest/tailmac/build

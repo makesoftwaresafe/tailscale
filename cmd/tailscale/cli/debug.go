@@ -22,16 +22,21 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"golang.org/x/net/http/httpproxy"
+	"golang.org/x/net/http2"
+	"tailscale.com/client/tailscale"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/control/controlhttp"
 	"tailscale.com/hostinfo"
+	"tailscale.com/internal/noiseconn"
 	"tailscale.com/ipn"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/paths"
@@ -44,9 +49,11 @@ import (
 )
 
 var debugCmd = &ffcli.Command{
-	Name:     "debug",
-	Exec:     runDebug,
-	LongHelp: `"tailscale debug" contains misc debug facilities; it is not a stable interface.`,
+	Name:       "debug",
+	Exec:       runDebug,
+	ShortUsage: "tailscale debug <debug-flags | subcommand>",
+	ShortHelp:  "Debug commands",
+	LongHelp:   hidden + `"tailscale debug" contains misc debug facilities; it is not a stable interface.`,
 	FlagSet: (func() *flag.FlagSet {
 		fs := newFlagSet("debug")
 		fs.StringVar(&debugArgs.file, "file", "", "get, delete:NAME, or NAME")
@@ -57,14 +64,16 @@ var debugCmd = &ffcli.Command{
 	})(),
 	Subcommands: []*ffcli.Command{
 		{
-			Name:      "derp-map",
-			Exec:      runDERPMap,
-			ShortHelp: "print DERP map",
+			Name:       "derp-map",
+			ShortUsage: "tailscale debug derp-map",
+			Exec:       runDERPMap,
+			ShortHelp:  "Print DERP map",
 		},
 		{
-			Name:      "component-logs",
-			Exec:      runDebugComponentLogs,
-			ShortHelp: "enable/disable debug logs for a component",
+			Name:       "component-logs",
+			ShortUsage: "tailscale debug component-logs [" + strings.Join(ipn.DebuggableComponents, "|") + "]",
+			Exec:       runDebugComponentLogs,
+			ShortHelp:  "Enable/disable debug logs for a component",
 			FlagSet: (func() *flag.FlagSet {
 				fs := newFlagSet("component-logs")
 				fs.DurationVar(&debugComponentLogsArgs.forDur, "for", time.Hour, "how long to enable debug logs for; zero or negative means to disable")
@@ -72,14 +81,16 @@ var debugCmd = &ffcli.Command{
 			})(),
 		},
 		{
-			Name:      "daemon-goroutines",
-			Exec:      runDaemonGoroutines,
-			ShortHelp: "print tailscaled's goroutines",
+			Name:       "daemon-goroutines",
+			ShortUsage: "tailscale debug daemon-goroutines",
+			Exec:       runDaemonGoroutines,
+			ShortHelp:  "Print tailscaled's goroutines",
 		},
 		{
-			Name:      "daemon-logs",
-			Exec:      runDaemonLogs,
-			ShortHelp: "watch tailscaled's server logs",
+			Name:       "daemon-logs",
+			ShortUsage: "tailscale debug daemon-logs",
+			Exec:       runDaemonLogs,
+			ShortHelp:  "Watch tailscaled's server logs",
 			FlagSet: (func() *flag.FlagSet {
 				fs := newFlagSet("daemon-logs")
 				fs.IntVar(&daemonLogsArgs.verbose, "verbose", 0, "verbosity level")
@@ -88,9 +99,10 @@ var debugCmd = &ffcli.Command{
 			})(),
 		},
 		{
-			Name:      "metrics",
-			Exec:      runDaemonMetrics,
-			ShortHelp: "print tailscaled's metrics",
+			Name:       "metrics",
+			ShortUsage: "tailscale debug metrics",
+			Exec:       runDaemonMetrics,
+			ShortHelp:  "Print tailscaled's metrics",
 			FlagSet: (func() *flag.FlagSet {
 				fs := newFlagSet("metrics")
 				fs.BoolVar(&metricsArgs.watch, "watch", false, "print JSON dump of delta values")
@@ -98,39 +110,101 @@ var debugCmd = &ffcli.Command{
 			})(),
 		},
 		{
-			Name:      "env",
-			Exec:      runEnv,
-			ShortHelp: "print cmd/tailscale environment",
+			Name:       "env",
+			ShortUsage: "tailscale debug env",
+			Exec:       runEnv,
+			ShortHelp:  "Print cmd/tailscale environment",
 		},
 		{
-			Name:      "stat",
-			Exec:      runStat,
-			ShortHelp: "stat a file",
+			Name:       "stat",
+			ShortUsage: "tailscale debug stat <files...>",
+			Exec:       runStat,
+			ShortHelp:  "Stat a file",
 		},
 		{
-			Name:      "hostinfo",
-			Exec:      runHostinfo,
-			ShortHelp: "print hostinfo",
+			Name:       "hostinfo",
+			ShortUsage: "tailscale debug hostinfo",
+			Exec:       runHostinfo,
+			ShortHelp:  "Print hostinfo",
 		},
 		{
-			Name:      "local-creds",
-			Exec:      runLocalCreds,
-			ShortHelp: "print how to access Tailscale LocalAPI",
+			Name:       "local-creds",
+			ShortUsage: "tailscale debug local-creds",
+			Exec:       runLocalCreds,
+			ShortHelp:  "Print how to access Tailscale LocalAPI",
 		},
 		{
-			Name:      "restun",
-			Exec:      localAPIAction("restun"),
-			ShortHelp: "force a magicsock restun",
+			Name:       "restun",
+			ShortUsage: "tailscale debug restun",
+			Exec:       localAPIAction("restun"),
+			ShortHelp:  "Force a magicsock restun",
 		},
 		{
-			Name:      "rebind",
-			Exec:      localAPIAction("rebind"),
-			ShortHelp: "force a magicsock rebind",
+			Name:       "rebind",
+			ShortUsage: "tailscale debug rebind",
+			Exec:       localAPIAction("rebind"),
+			ShortHelp:  "Force a magicsock rebind",
 		},
 		{
-			Name:      "prefs",
-			Exec:      runPrefs,
-			ShortHelp: "print prefs",
+			Name:       "derp-set-on-demand",
+			ShortUsage: "tailscale debug derp-set-on-demand",
+			Exec:       localAPIAction("derp-set-homeless"),
+			ShortHelp:  "Enable DERP on-demand mode (breaks reachability)",
+		},
+		{
+			Name:       "derp-unset-on-demand",
+			ShortUsage: "tailscale debug derp-unset-on-demand",
+			Exec:       localAPIAction("derp-unset-homeless"),
+			ShortHelp:  "Disable DERP on-demand mode",
+		},
+		{
+			Name:       "break-tcp-conns",
+			ShortUsage: "tailscale debug break-tcp-conns",
+			Exec:       localAPIAction("break-tcp-conns"),
+			ShortHelp:  "Break any open TCP connections from the daemon",
+		},
+		{
+			Name:       "break-derp-conns",
+			ShortUsage: "tailscale debug break-derp-conns",
+			Exec:       localAPIAction("break-derp-conns"),
+			ShortHelp:  "Break any open DERP connections from the daemon",
+		},
+		{
+			Name:       "pick-new-derp",
+			ShortUsage: "tailscale debug pick-new-derp",
+			Exec:       localAPIAction("pick-new-derp"),
+			ShortHelp:  "Switch to some other random DERP home region for a short time",
+		},
+		{
+			Name:       "force-prefer-derp",
+			ShortUsage: "tailscale debug force-prefer-derp",
+			Exec:       forcePreferDERP,
+			ShortHelp:  "Prefer the given region ID if reachable (until restart, or 0 to clear)",
+		},
+		{
+			Name:       "force-netmap-update",
+			ShortUsage: "tailscale debug force-netmap-update",
+			Exec:       localAPIAction("force-netmap-update"),
+			ShortHelp:  "Force a full no-op netmap update (for load testing)",
+		},
+		{
+			// TODO(bradfitz,maisem): eventually promote this out of debug
+			Name:       "reload-config",
+			ShortUsage: "tailscale debug reload-config",
+			Exec:       reloadConfig,
+			ShortHelp:  "Reload config",
+		},
+		{
+			Name:       "control-knobs",
+			ShortUsage: "tailscale debug control-knobs",
+			Exec:       debugControlKnobs,
+			ShortHelp:  "See current control knobs",
+		},
+		{
+			Name:       "prefs",
+			ShortUsage: "tailscale debug prefs",
+			Exec:       runPrefs,
+			ShortHelp:  "Print prefs",
 			FlagSet: (func() *flag.FlagSet {
 				fs := newFlagSet("prefs")
 				fs.BoolVar(&prefsArgs.pretty, "pretty", false, "If true, pretty-print output")
@@ -138,26 +212,43 @@ var debugCmd = &ffcli.Command{
 			})(),
 		},
 		{
-			Name:      "watch-ipn",
-			Exec:      runWatchIPN,
-			ShortHelp: "subscribe to IPN message bus",
+			Name:       "watch-ipn",
+			ShortUsage: "tailscale debug watch-ipn",
+			Exec:       runWatchIPN,
+			ShortHelp:  "Subscribe to IPN message bus",
 			FlagSet: (func() *flag.FlagSet {
 				fs := newFlagSet("watch-ipn")
 				fs.BoolVar(&watchIPNArgs.netmap, "netmap", true, "include netmap in messages")
 				fs.BoolVar(&watchIPNArgs.initial, "initial", false, "include initial status")
+				fs.BoolVar(&watchIPNArgs.rateLimit, "rate-limit", true, "rate limit messags")
 				fs.BoolVar(&watchIPNArgs.showPrivateKey, "show-private-key", false, "include node private key in printed netmap")
+				fs.IntVar(&watchIPNArgs.count, "count", 0, "exit after printing this many statuses, or 0 to keep going forever")
 				return fs
 			})(),
 		},
 		{
-			Name:      "via",
-			Exec:      runVia,
-			ShortHelp: "convert between site-specific IPv4 CIDRs and IPv6 'via' routes",
+			Name:       "netmap",
+			ShortUsage: "tailscale debug netmap",
+			Exec:       runNetmap,
+			ShortHelp:  "Print the current network map",
+			FlagSet: (func() *flag.FlagSet {
+				fs := newFlagSet("netmap")
+				fs.BoolVar(&netmapArgs.showPrivateKey, "show-private-key", false, "include node private key in printed netmap")
+				return fs
+			})(),
 		},
 		{
-			Name:      "ts2021",
-			Exec:      runTS2021,
-			ShortHelp: "debug ts2021 protocol connectivity",
+			Name: "via",
+			ShortUsage: "tailscale debug via <site-id> <v4-cidr>\n" +
+				"tailscale debug via <v6-route>",
+			Exec:      runVia,
+			ShortHelp: "Convert between site-specific IPv4 CIDRs and IPv6 'via' routes",
+		},
+		{
+			Name:       "ts2021",
+			ShortUsage: "tailscale debug ts2021",
+			Exec:       runTS2021,
+			ShortHelp:  "Debug ts2021 protocol connectivity",
 			FlagSet: (func() *flag.FlagSet {
 				fs := newFlagSet("ts2021")
 				fs.StringVar(&ts2021Args.host, "host", "controlplane.tailscale.com", "hostname of control plane")
@@ -167,9 +258,10 @@ var debugCmd = &ffcli.Command{
 			})(),
 		},
 		{
-			Name:      "set-expire",
-			Exec:      runSetExpire,
-			ShortHelp: "manipulate node key expiry for testing",
+			Name:       "set-expire",
+			ShortUsage: "tailscale debug set-expire --in=1m",
+			Exec:       runSetExpire,
+			ShortHelp:  "Manipulate node key expiry for testing",
 			FlagSet: (func() *flag.FlagSet {
 				fs := newFlagSet("set-expire")
 				fs.DurationVar(&setExpireArgs.in, "in", 0, "if non-zero, set node key to expire this duration from now")
@@ -177,9 +269,10 @@ var debugCmd = &ffcli.Command{
 			})(),
 		},
 		{
-			Name:      "dev-store-set",
-			Exec:      runDevStoreSet,
-			ShortHelp: "set a key/value pair during development",
+			Name:       "dev-store-set",
+			ShortUsage: "tailscale debug dev-store-set",
+			Exec:       runDevStoreSet,
+			ShortHelp:  "Set a key/value pair during development",
 			FlagSet: (func() *flag.FlagSet {
 				fs := newFlagSet("store-set")
 				fs.BoolVar(&devStoreSetArgs.danger, "danger", false, "accept danger")
@@ -187,14 +280,16 @@ var debugCmd = &ffcli.Command{
 			})(),
 		},
 		{
-			Name:      "derp",
-			Exec:      runDebugDERP,
-			ShortHelp: "test a DERP configuration",
+			Name:       "derp",
+			ShortUsage: "tailscale debug derp",
+			Exec:       runDebugDERP,
+			ShortHelp:  "Test a DERP configuration",
 		},
 		{
-			Name:      "capture",
-			Exec:      runCapture,
-			ShortHelp: "streams pcaps for debugging",
+			Name:       "capture",
+			ShortUsage: "tailscale debug capture",
+			Exec:       runCapture,
+			ShortHelp:  "Streams pcaps for debugging",
 			FlagSet: (func() *flag.FlagSet {
 				fs := newFlagSet("capture")
 				fs.StringVar(&captureArgs.outFile, "o", "", "path to stream the pcap (or - for stdout), leave empty to start wireshark")
@@ -202,23 +297,65 @@ var debugCmd = &ffcli.Command{
 			})(),
 		},
 		{
-			Name:      "portmap",
-			Exec:      debugPortmap,
-			ShortHelp: "run portmap debugging debugging",
+			Name:       "portmap",
+			ShortUsage: "tailscale debug portmap",
+			Exec:       debugPortmap,
+			ShortHelp:  "Run portmap debugging",
 			FlagSet: (func() *flag.FlagSet {
 				fs := newFlagSet("portmap")
 				fs.DurationVar(&debugPortmapArgs.duration, "duration", 5*time.Second, "timeout for port mapping")
 				fs.StringVar(&debugPortmapArgs.ty, "type", "", `portmap debug type (one of "", "pmp", "pcp", or "upnp")`)
-				fs.StringVar(&debugPortmapArgs.gwSelf, "gw-self", "", `override gateway and self IP (format: "gatewayIP/selfIP")`)
+				fs.StringVar(&debugPortmapArgs.gatewayAddr, "gateway-addr", "", `override gateway IP (must also pass --self-addr)`)
+				fs.StringVar(&debugPortmapArgs.selfAddr, "self-addr", "", `override self IP (must also pass --gateway-addr)`)
+				fs.BoolVar(&debugPortmapArgs.logHTTP, "log-http", false, `print all HTTP requests and responses to the log`)
 				return fs
 			})(),
 		},
 		{
-			Name:      "peer-endpoint-changes",
-			Exec:      runPeerEndpointChanges,
-			ShortHelp: "prints debug information about a peer's endpoint changes",
+			Name:       "peer-endpoint-changes",
+			ShortUsage: "tailscale debug peer-endpoint-changes <hostname-or-IP>",
+			Exec:       runPeerEndpointChanges,
+			ShortHelp:  "Prints debug information about a peer's endpoint changes",
+		},
+		{
+			Name:       "dial-types",
+			ShortUsage: "tailscale debug dial-types <hostname-or-IP> <port>",
+			Exec:       runDebugDialTypes,
+			ShortHelp:  "Prints debug information about connecting to a given host or IP",
+			FlagSet: (func() *flag.FlagSet {
+				fs := newFlagSet("dial-types")
+				fs.StringVar(&debugDialTypesArgs.network, "network", "tcp", `network type to dial ("tcp", "udp", etc.)`)
+				return fs
+			})(),
+		},
+		{
+			Name:       "resolve",
+			ShortUsage: "tailscale debug resolve <hostname>",
+			Exec:       runDebugResolve,
+			ShortHelp:  "Does a DNS lookup",
+			FlagSet: (func() *flag.FlagSet {
+				fs := newFlagSet("resolve")
+				fs.StringVar(&resolveArgs.net, "net", "ip", "network type to resolve (ip, ip4, ip6)")
+				return fs
+			})(),
+		},
+		{
+			Name:       "go-buildinfo",
+			ShortUsage: "tailscale debug go-buildinfo",
+			ShortHelp:  "Prints Go's runtime/debug.BuildInfo",
+			Exec:       runGoBuildInfo,
 		},
 	},
+}
+
+func runGoBuildInfo(ctx context.Context, args []string) error {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return errors.New("no Go build info")
+	}
+	e := json.NewEncoder(os.Stdout)
+	e.SetIndent("", "\t")
+	return e.Encode(bi)
 }
 
 var debugArgs struct {
@@ -248,7 +385,7 @@ func outName(dst string) string {
 
 func runDebug(ctx context.Context, args []string) error {
 	if len(args) > 0 {
-		return errors.New("unknown arguments")
+		return fmt.Errorf("tailscale debug: unknown subcommand: %s", args[0])
 	}
 	var usedFlag bool
 	if out := debugArgs.cpuFile; out != "" {
@@ -303,7 +440,7 @@ func runDebug(ctx context.Context, args []string) error {
 		// to subcommands.
 		return nil
 	}
-	return errors.New("see 'tailscale debug --help")
+	return errors.New("tailscale debug: subcommand or flag required")
 }
 
 func runLocalCreds(ctx context.Context, args []string) error {
@@ -371,6 +508,8 @@ var watchIPNArgs struct {
 	netmap         bool
 	initial        bool
 	showPrivateKey bool
+	rateLimit      bool
+	count          int
 }
 
 func runWatchIPN(ctx context.Context, args []string) error {
@@ -381,13 +520,16 @@ func runWatchIPN(ctx context.Context, args []string) error {
 	if !watchIPNArgs.showPrivateKey {
 		mask |= ipn.NotifyNoPrivateKeys
 	}
+	if watchIPNArgs.rateLimit {
+		mask |= ipn.NotifyRateLimit
+	}
 	watcher, err := localClient.WatchIPNBus(ctx, mask)
 	if err != nil {
 		return err
 	}
 	defer watcher.Close()
-	printf("Connected.\n")
-	for {
+	fmt.Fprintf(Stderr, "Connected.\n")
+	for seen := 0; watchIPNArgs.count == 0 || seen < watchIPNArgs.count; seen++ {
 		n, err := watcher.Next()
 		if err != nil {
 			return err
@@ -396,8 +538,36 @@ func runWatchIPN(ctx context.Context, args []string) error {
 			n.NetMap = nil
 		}
 		j, _ := json.MarshalIndent(n, "", "\t")
-		printf("%s\n", j)
+		fmt.Printf("%s\n", j)
 	}
+	return nil
+}
+
+var netmapArgs struct {
+	showPrivateKey bool
+}
+
+func runNetmap(ctx context.Context, args []string) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	var mask ipn.NotifyWatchOpt = ipn.NotifyInitialNetMap
+	if !netmapArgs.showPrivateKey {
+		mask |= ipn.NotifyNoPrivateKeys
+	}
+	watcher, err := localClient.WatchIPNBus(ctx, mask)
+	if err != nil {
+		return err
+	}
+	defer watcher.Close()
+
+	n, err := watcher.Next()
+	if err != nil {
+		return err
+	}
+	j, _ := json.MarshalIndent(n.NetMap, "", "\t")
+	fmt.Printf("%s\n", j)
+	return nil
 }
 
 func runDERPMap(ctx context.Context, args []string) error {
@@ -413,6 +583,25 @@ func runDERPMap(ctx context.Context, args []string) error {
 	return nil
 }
 
+func forcePreferDERP(ctx context.Context, args []string) error {
+	var n int
+	if len(args) != 1 {
+		return errors.New("expected exactly one integer argument")
+	}
+	n, err := strconv.Atoi(args[0])
+	if err != nil {
+		return fmt.Errorf("expected exactly one integer argument: %w", err)
+	}
+	b, err := json.Marshal(n)
+	if err != nil {
+		return fmt.Errorf("failed to marshal DERP region: %w", err)
+	}
+	if err := localClient.DebugActionBody(ctx, "force-prefer-derp", bytes.NewReader(b)); err != nil {
+		return fmt.Errorf("failed to force preferred DERP: %w", err)
+	}
+	return nil
+}
+
 func localAPIAction(action string) func(context.Context, []string) error {
 	return func(ctx context.Context, args []string) error {
 		if len(args) > 0 {
@@ -420,6 +609,20 @@ func localAPIAction(action string) func(context.Context, []string) error {
 		}
 		return localClient.DebugAction(ctx, action)
 	}
+}
+
+func reloadConfig(ctx context.Context, args []string) error {
+	ok, err := localClient.ReloadConfig(ctx)
+	if err != nil {
+		return err
+	}
+	if ok {
+		printf("config reloaded\n")
+		return nil
+	}
+	printf("config mode not in use\n")
+	os.Exit(1)
+	panic("unreachable")
 }
 
 func runEnv(ctx context.Context, args []string) error {
@@ -454,7 +657,7 @@ func runStat(ctx context.Context, args []string) error {
 func runHostinfo(ctx context.Context, args []string) error {
 	hi := hostinfo.New()
 	j, _ := json.MarshalIndent(hi, "", "  ")
-	os.Stdout.Write(j)
+	Stdout.Write(j)
 	return nil
 }
 
@@ -584,8 +787,8 @@ func runVia(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("invalid site-id %q; must be decimal or hex with 0x prefix", args[0])
 		}
-		if siteID > 0xff {
-			return fmt.Errorf("site-id values over 255 are currently reserved")
+		if siteID > 0xffff {
+			return fmt.Errorf("site-id values over 65535 are currently reserved")
 		}
 		ipp, err := netip.ParsePrefix(args[1])
 		if err != nil {
@@ -607,7 +810,7 @@ var ts2021Args struct {
 }
 
 func runTS2021(ctx context.Context, args []string) error {
-	log.SetOutput(os.Stdout)
+	log.SetOutput(Stdout)
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
 	keysURL := "https://" + ts2021Args.host + "/key?v=" + strconv.Itoa(ts2021Args.version)
@@ -659,7 +862,10 @@ func runTS2021(ctx context.Context, args []string) error {
 		log.Printf("Dial(%q, %q) ...", network, address)
 		c, err := dialer.DialContext(ctx, network, address)
 		if err != nil {
-			log.Printf("Dial(%q, %q) = %v", network, address, err)
+			// skip logging context cancellation errors
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("Dial(%q, %q) = %v", network, address, err)
+			}
 		} else {
 			log.Printf("Dial(%q, %q) = %v / %v", network, address, c.LocalAddr(), c.RemoteAddr())
 		}
@@ -669,7 +875,13 @@ func runTS2021(ctx context.Context, args []string) error {
 	if ts2021Args.verbose {
 		logf = log.Printf
 	}
-	conn, err := (&controlhttp.Dialer{
+
+	netMon, err := netmon.New(logger.WithPrefix(logf, "netmon: "))
+	if err != nil {
+		return fmt.Errorf("creating netmon: %w", err)
+	}
+
+	noiseDialer := &controlhttp.Dialer{
 		Hostname:        ts2021Args.host,
 		HTTPPort:        "80",
 		HTTPSPort:       "443",
@@ -678,7 +890,22 @@ func runTS2021(ctx context.Context, args []string) error {
 		ProtocolVersion: uint16(ts2021Args.version),
 		Dialer:          dialFunc,
 		Logf:            logf,
-	}).Dial(ctx)
+		NetMon:          netMon,
+	}
+	const tries = 2
+	for i := range tries {
+		err := tryConnect(ctx, keys.PublicKey, noiseDialer)
+		if err != nil {
+			log.Printf("error on attempt %d/%d: %v", i+1, tries, err)
+			continue
+		}
+		break
+	}
+	return nil
+}
+
+func tryConnect(ctx context.Context, controlPublic key.MachinePublic, noiseDialer *controlhttp.Dialer) error {
+	conn, err := noiseDialer.Dial(ctx)
 	log.Printf("controlhttp.Dial = %p, %v", conn, err)
 	if err != nil {
 		return err
@@ -686,12 +913,58 @@ func runTS2021(ctx context.Context, args []string) error {
 	log.Printf("did noise handshake")
 
 	gotPeer := conn.Peer()
-	if gotPeer != keys.PublicKey {
-		log.Printf("peer = %v, want %v", gotPeer, keys.PublicKey)
+	if gotPeer != controlPublic {
+		log.Printf("peer = %v, want %v", gotPeer, controlPublic)
 		return errors.New("key mismatch")
 	}
 
 	log.Printf("final underlying conn: %v / %v", conn.LocalAddr(), conn.RemoteAddr())
+
+	h2Transport, err := http2.ConfigureTransports(&http.Transport{
+		IdleConnTimeout: time.Second,
+	})
+	if err != nil {
+		return fmt.Errorf("http2.ConfigureTransports: %w", err)
+	}
+
+	// Now, create a Noise conn over the existing conn.
+	nc, err := noiseconn.New(conn.Conn, h2Transport, 0, nil)
+	if err != nil {
+		return fmt.Errorf("noiseconn.New: %w", err)
+	}
+	defer nc.Close()
+
+	// Reserve a RoundTrip for the whoami request.
+	ok, _, err := nc.ReserveNewRequest(ctx)
+	if err != nil {
+		return fmt.Errorf("ReserveNewRequest: %w", err)
+	}
+	if !ok {
+		return errors.New("ReserveNewRequest failed")
+	}
+
+	// Make a /whoami request to the server to verify that we can actually
+	// communicate over the newly-established connection.
+	whoamiURL := "http://" + ts2021Args.host + "/machine/whoami"
+	req, err := http.NewRequestWithContext(ctx, "GET", whoamiURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := nc.RoundTrip(req)
+	if err != nil {
+		return fmt.Errorf("RoundTrip whoami request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		log.Printf("whoami request returned status %v", resp.Status)
+	} else {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("reading whoami response: %w", err)
+		}
+		log.Printf("whoami response: %q", body)
+	}
 	return nil
 }
 
@@ -701,7 +974,7 @@ var debugComponentLogsArgs struct {
 
 func runDebugComponentLogs(ctx context.Context, args []string) error {
 	if len(args) != 1 {
-		return errors.New("usage: debug component-logs <component>")
+		return errors.New("usage: tailscale debug component-logs [" + strings.Join(ipn.DebuggableComponents, "|") + "]")
 	}
 	component := args[0]
 	dur := debugComponentLogsArgs.forDur
@@ -724,7 +997,7 @@ var devStoreSetArgs struct {
 
 func runDevStoreSet(ctx context.Context, args []string) error {
 	if len(args) != 2 {
-		return errors.New("usage: dev-store-set --danger <key> <value>")
+		return errors.New("usage: tailscale debug dev-store-set --danger <key> <value>")
 	}
 	if !devStoreSetArgs.danger {
 		return errors.New("this command is dangerous; use --danger to proceed")
@@ -742,7 +1015,7 @@ func runDevStoreSet(ctx context.Context, args []string) error {
 
 func runDebugDERP(ctx context.Context, args []string) error {
 	if len(args) != 1 {
-		return errors.New("usage: debug derp <region>")
+		return errors.New("usage: tailscale debug derp <region>")
 	}
 	st, err := localClient.DebugDERPRegion(ctx, args[0])
 	if err != nil {
@@ -758,7 +1031,7 @@ var setExpireArgs struct {
 
 func runSetExpire(ctx context.Context, args []string) error {
 	if len(args) != 0 || setExpireArgs.in == 0 {
-		return errors.New("usage --in=<duration>")
+		return errors.New("usage: tailscale debug set-expire --in=<duration>")
 	}
 	return localClient.DebugSetExpireIn(ctx, setExpireArgs.in)
 }
@@ -776,7 +1049,7 @@ func runCapture(ctx context.Context, args []string) error {
 
 	switch captureArgs.outFile {
 	case "-":
-		fmt.Fprintln(os.Stderr, "Press Ctrl-C to stop the capture.")
+		fmt.Fprintln(Stderr, "Press Ctrl-C to stop the capture.")
 		_, err = io.Copy(os.Stdout, stream)
 		return err
 	case "":
@@ -802,23 +1075,40 @@ func runCapture(ctx context.Context, args []string) error {
 		return err
 	}
 	defer f.Close()
-	fmt.Fprintln(os.Stderr, "Press Ctrl-C to stop the capture.")
+	fmt.Fprintln(Stderr, "Press Ctrl-C to stop the capture.")
 	_, err = io.Copy(f, stream)
 	return err
 }
 
 var debugPortmapArgs struct {
-	duration time.Duration
-	gwSelf   string
-	ty       string
+	duration    time.Duration
+	gatewayAddr string
+	selfAddr    string
+	ty          string
+	logHTTP     bool
 }
 
 func debugPortmap(ctx context.Context, args []string) error {
-	rc, err := localClient.DebugPortmap(ctx,
-		debugPortmapArgs.duration,
-		debugPortmapArgs.ty,
-		debugPortmapArgs.gwSelf,
-	)
+	opts := &tailscale.DebugPortmapOpts{
+		Duration: debugPortmapArgs.duration,
+		Type:     debugPortmapArgs.ty,
+		LogHTTP:  debugPortmapArgs.logHTTP,
+	}
+	if (debugPortmapArgs.gatewayAddr != "") != (debugPortmapArgs.selfAddr != "") {
+		return fmt.Errorf("if one of --gateway-addr and --self-addr is provided, the other must be as well")
+	}
+	if debugPortmapArgs.gatewayAddr != "" {
+		var err error
+		opts.GatewayAddr, err = netip.ParseAddr(debugPortmapArgs.gatewayAddr)
+		if err != nil {
+			return fmt.Errorf("invalid --gateway-addr: %w", err)
+		}
+		opts.SelfAddr, err = netip.ParseAddr(debugPortmapArgs.selfAddr)
+		if err != nil {
+			return fmt.Errorf("invalid --self-addr: %w", err)
+		}
+	}
+	rc, err := localClient.DebugPortmap(ctx, opts)
 	if err != nil {
 		return err
 	}
@@ -840,7 +1130,7 @@ func runPeerEndpointChanges(ctx context.Context, args []string) error {
 	}
 
 	if len(args) != 1 || args[0] == "" {
-		return errors.New("usage: peer-status <hostname-or-IP>")
+		return errors.New("usage: tailscale debug peer-endpoint-changes <hostname-or-IP>")
 	}
 	var ip string
 
@@ -883,5 +1173,100 @@ func runPeerEndpointChanges(ctx context.Context, args []string) error {
 		dst.WriteByte('\n')
 	}
 	fmt.Printf("%s", dst.String())
+	return nil
+}
+
+func debugControlKnobs(ctx context.Context, args []string) error {
+	if len(args) > 0 {
+		return errors.New("unexpected arguments")
+	}
+	v, err := localClient.DebugResultJSON(ctx, "control-knobs")
+	if err != nil {
+		return err
+	}
+	e := json.NewEncoder(os.Stdout)
+	e.SetIndent("", "  ")
+	e.Encode(v)
+	return nil
+}
+
+var debugDialTypesArgs struct {
+	network string
+}
+
+func runDebugDialTypes(ctx context.Context, args []string) error {
+	st, err := localClient.Status(ctx)
+	if err != nil {
+		return fixTailscaledConnectError(err)
+	}
+	description, ok := isRunningOrStarting(st)
+	if !ok {
+		printf("%s\n", description)
+		os.Exit(1)
+	}
+
+	if len(args) != 2 || args[0] == "" || args[1] == "" {
+		return errors.New("usage: tailscale debug dial-types <hostname-or-IP> <port>")
+	}
+
+	port, err := strconv.ParseUint(args[1], 10, 16)
+	if err != nil {
+		return fmt.Errorf("invalid port %q: %w", args[1], err)
+	}
+
+	hostOrIP := args[0]
+	ip, _, err := tailscaleIPFromArg(ctx, hostOrIP)
+	if err != nil {
+		return err
+	}
+	if ip != hostOrIP {
+		log.Printf("lookup %q => %q", hostOrIP, ip)
+	}
+
+	qparams := make(url.Values)
+	qparams.Set("ip", ip)
+	qparams.Set("port", strconv.FormatUint(port, 10))
+	qparams.Set("network", debugDialTypesArgs.network)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "http://local-tailscaled.sock/localapi/v0/debug-dial-types?"+qparams.Encode(), nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := localClient.DoLocalRequest(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("%s", body)
+	return nil
+}
+
+var resolveArgs struct {
+	net string // "ip", "ip4", "ip6""
+}
+
+func runDebugResolve(ctx context.Context, args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: tailscale debug resolve <hostname>")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	host := args[0]
+	ips, err := net.DefaultResolver.LookupIP(ctx, resolveArgs.net, host)
+	if err != nil {
+		return err
+	}
+	for _, ip := range ips {
+		fmt.Printf("%s\n", ip)
+	}
 	return nil
 }

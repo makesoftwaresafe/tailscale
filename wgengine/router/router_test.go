@@ -11,6 +11,7 @@ import (
 	"tailscale.com/types/preftype"
 )
 
+//lint:ignore U1000 used in Windows/Linux tests only
 func mustCIDRs(ss ...string) []netip.Prefix {
 	var ret []netip.Prefix
 	for _, s := range ss {
@@ -21,12 +22,13 @@ func mustCIDRs(ss ...string) []netip.Prefix {
 
 func TestConfigEqual(t *testing.T) {
 	testedFields := []string{
-		"LocalAddrs", "Routes", "LocalRoutes", "SubnetRoutes",
-		"SNATSubnetRoutes", "NetfilterMode",
+		"LocalAddrs", "Routes", "LocalRoutes", "NewMTU",
+		"SubnetRoutes", "SNATSubnetRoutes", "StatefulFiltering",
+		"NetfilterMode", "NetfilterKind",
 	}
-	configType := reflect.TypeOf(Config{})
+	configType := reflect.TypeFor[Config]()
 	configFields := []string{}
-	for i := 0; i < configType.NumField(); i++ {
+	for i := range configType.NumField() {
 		configFields = append(configFields, configType.Field(i).Name)
 	}
 	if !reflect.DeepEqual(configFields, testedFields) {
@@ -123,6 +125,16 @@ func TestConfigEqual(t *testing.T) {
 			&Config{SNATSubnetRoutes: false},
 			true,
 		},
+		{
+			&Config{StatefulFiltering: false},
+			&Config{StatefulFiltering: true},
+			false,
+		},
+		{
+			&Config{StatefulFiltering: false},
+			&Config{StatefulFiltering: false},
+			true,
+		},
 
 		{
 			&Config{NetfilterMode: preftype.NetfilterOff},
@@ -133,6 +145,16 @@ func TestConfigEqual(t *testing.T) {
 			&Config{NetfilterMode: preftype.NetfilterNoDivert},
 			&Config{NetfilterMode: preftype.NetfilterNoDivert},
 			true,
+		},
+		{
+			&Config{NewMTU: 0},
+			&Config{NewMTU: 0},
+			true,
+		},
+		{
+			&Config{NewMTU: 1280},
+			&Config{NewMTU: 0},
+			false,
 		},
 	}
 	for i, tt := range tests {
