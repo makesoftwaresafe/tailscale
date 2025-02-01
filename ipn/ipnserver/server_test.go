@@ -251,6 +251,58 @@ func TestConcurrentOSUserSwitchingOnWindows(t *testing.T) {
 			}()
 		}
 		wg.Wait()
+
+		if err := server.blockWhileInUse(ctx); err != nil {
+			t.Fatalf("blockWhileInUse: %v", err)
+		}
+
+		server.checkCurrentUser(nil)
+	}
+}
+
+func TestBlockWhileIdentityInUse(t *testing.T) {
+	enableLogging := false
+	setGOOSForTest(t, "windows")
+
+	ctx := context.Background()
+	server := startDefaultTestIPNServer(t, ctx, enableLogging)
+
+	// connectWaitDisconnectAsUser connects as a user with the specified name
+	// and keeps the IPN bus watcher alive until the context is canceled.
+	// It returns a channel that is closed when done.
+	connectWaitDisconnectAsUser := func(ctx context.Context, name string) <-chan struct{} {
+		client := server.getClientAs(name)
+		watcher, cancelWatcher := client.WatchIPNBus(ctx, 0)
+
+		done := make(chan struct{})
+		go func() {
+			defer cancelWatcher()
+			defer close(done)
+			for {
+				_, err := watcher.Next()
+				if err != nil {
+					// There's either an error or the request has been canceled.
+					break
+				}
+			}
+		}()
+		return done
+	}
+
+	for range 100 {
+		// Connect as UserA, and keep the connection alive
+		// until disconnectUserA is called.
+		userAContext, disconnectUserA := context.WithCancel(ctx)
+		userADone := connectWaitDisconnectAsUser(userAContext, "UserA")
+		disconnectUserA()
+		// Check if userB can connect. Calling it directly increases
+		// the likelihood of triggering a deadlock due to a race condition
+		// in blockWhileIdentityInUse. But the issue also occurs during
+		// the normal execution path when UserB connects to the IPN server
+		// while UserA is disconnecting.
+		userB := server.makeTestUser("UserB", "ClientB")
+		server.blockWhileIdentityInUse(ctx, userB)
+		<-userADone
 	}
 }
 
@@ -346,7 +398,14 @@ func (s *testIPNServer) makeTestUser(name string, clientID string) *ipnauth.Test
 
 func (s *testIPNServer) blockWhileInUse(ctx context.Context) error {
 	ready, cleanup := s.zeroReqWaiter.add(&s.mu, ctx)
-	<-ready
+
+	s.mu.Lock()
+	busy := len(s.activeReqs) != 0
+	s.mu.Unlock()
+
+	if busy {
+		<-ready
+	}
 	cleanup()
 	return ctx.Err()
 }

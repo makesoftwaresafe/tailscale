@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/netip"
 	"reflect"
 	"strings"
@@ -29,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/mak"
@@ -581,6 +583,21 @@ func mustCreate(t *testing.T, client client.Client, obj client.Object) {
 		t.Fatalf("creating %q: %v", obj.GetName(), err)
 	}
 }
+func mustCreateAll(t *testing.T, client client.Client, objs ...client.Object) {
+	t.Helper()
+	for _, obj := range objs {
+		mustCreate(t, client, obj)
+	}
+}
+
+func mustDeleteAll(t *testing.T, client client.Client, objs ...client.Object) {
+	t.Helper()
+	for _, obj := range objs {
+		if err := client.Delete(context.Background(), obj); err != nil {
+			t.Fatalf("deleting %q: %v", obj.GetName(), err)
+		}
+	}
+}
 
 func mustUpdate[T any, O ptrObject[T]](t *testing.T, client client.Client, ns, name string, update func(O)) {
 	t.Helper()
@@ -618,7 +635,7 @@ func mustUpdateStatus[T any, O ptrObject[T]](t *testing.T, client client.Client,
 // modify func to ensure that they are removed from the cluster object and the
 // object passed as 'want'. If no such modifications are needed, you can pass
 // nil in place of the modify function.
-func expectEqual[T any, O ptrObject[T]](t *testing.T, client client.Client, want O, modifier func(O)) {
+func expectEqual[T any, O ptrObject[T]](t *testing.T, client client.Client, want O, modifiers ...func(O)) {
 	t.Helper()
 	got := O(new(T))
 	if err := client.Get(context.Background(), types.NamespacedName{
@@ -632,7 +649,7 @@ func expectEqual[T any, O ptrObject[T]](t *testing.T, client client.Client, want
 	// so just remove it from both got and want.
 	got.SetResourceVersion("")
 	want.SetResourceVersion("")
-	if modifier != nil {
+	for _, modifier := range modifiers {
 		modifier(want)
 		modifier(got)
 	}
@@ -704,6 +721,19 @@ func expectRequeue(t *testing.T, sr reconcile.Reconciler, ns, name string) {
 		t.Fatalf("expected timed requeue, got success")
 	}
 }
+func expectError(t *testing.T, sr reconcile.Reconciler, ns, name string) {
+	t.Helper()
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      name,
+			Namespace: ns,
+		},
+	}
+	_, err := sr.Reconcile(context.Background(), req)
+	if err == nil {
+		t.Error("Reconcile: expected error but did not get one")
+	}
+}
 
 // expectEvents accepts a test recorder and a list of events, tests that expected
 // events are sent down the recorder's channel. Waits for 5s for each event.
@@ -737,6 +767,7 @@ type fakeTSClient struct {
 	sync.Mutex
 	keyRequests []tailscale.KeyCapabilities
 	deleted     []string
+	vipServices map[string]*VIPService
 }
 type fakeTSNetServer struct {
 	certDomains []string
@@ -799,6 +830,12 @@ func removeHashAnnotation(sts *appsv1.StatefulSet) {
 	}
 }
 
+func removeResourceReqs(sts *appsv1.StatefulSet) {
+	if sts != nil {
+		sts.Spec.Template.Spec.Resources = nil
+	}
+}
+
 func removeTargetPortsFromSvc(svc *corev1.Service) {
 	newPorts := make([]corev1.ServicePort, 0)
 	for _, p := range svc.Spec.Ports {
@@ -835,4 +872,51 @@ func removeAuthKeyIfExistsModifier(t *testing.T) func(s *corev1.Secret) {
 			mak.Set(&secret.StringData, "cap-107.hujson", string(b))
 		}
 	}
+}
+
+func (c *fakeTSClient) getVIPServiceByName(ctx context.Context, name string) (*VIPService, error) {
+	c.Lock()
+	defer c.Unlock()
+	if c.vipServices == nil {
+		return nil, &tailscale.ErrResponse{Status: http.StatusNotFound}
+	}
+	svc, ok := c.vipServices[name]
+	if !ok {
+		return nil, &tailscale.ErrResponse{Status: http.StatusNotFound}
+	}
+	return svc, nil
+}
+
+func (c *fakeTSClient) createOrUpdateVIPServiceByName(ctx context.Context, svc *VIPService) error {
+	c.Lock()
+	defer c.Unlock()
+	if c.vipServices == nil {
+		c.vipServices = make(map[string]*VIPService)
+	}
+	c.vipServices[svc.Name] = svc
+	return nil
+}
+
+func (c *fakeTSClient) deleteVIPServiceByName(ctx context.Context, name string) error {
+	c.Lock()
+	defer c.Unlock()
+	if c.vipServices != nil {
+		delete(c.vipServices, name)
+	}
+	return nil
+}
+
+type fakeLocalClient struct {
+	status *ipnstate.Status
+}
+
+func (f *fakeLocalClient) StatusWithoutPeers(ctx context.Context) (*ipnstate.Status, error) {
+	if f.status == nil {
+		return &ipnstate.Status{
+			Self: &ipnstate.PeerStatus{
+				DNSName: "test-node.test.ts.net.",
+			},
+		}, nil
+	}
+	return f.status, nil
 }

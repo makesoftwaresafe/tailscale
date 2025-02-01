@@ -17,6 +17,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/util/ctxkey"
 	"tailscale.com/util/osuser"
+	"tailscale.com/util/syspolicy"
 	"tailscale.com/version"
 )
 
@@ -56,6 +57,24 @@ func newActor(logf logger.Logf, c net.Conn) (*actor, error) {
 		clientID = ipnauth.ClientIDFrom(pid)
 	}
 	return &actor{logf: logf, ci: ci, clientID: clientID, isLocalSystem: connIsLocalSystem(ci)}, nil
+}
+
+// CheckProfileAccess implements [ipnauth.Actor].
+func (a *actor) CheckProfileAccess(profile ipn.LoginProfileView, requestedAccess ipnauth.ProfileAccess) error {
+	if profile.LocalUserID() != a.UserID() {
+		return errors.New("the target profile does not belong to the user")
+	}
+	switch requestedAccess {
+	case ipnauth.Disconnect:
+		if alwaysOn, _ := syspolicy.GetBoolean(syspolicy.AlwaysOn, false); alwaysOn {
+			// TODO(nickkhyl): check if disconnecting with justifications is allowed
+			// and whether a justification is included in the request.
+			return errors.New("profile access denied: always-on mode is enabled")
+		}
+		return nil
+	default:
+		return errors.New("the requested operation is not allowed")
+	}
 }
 
 // IsLocalSystem implements [ipnauth.Actor].

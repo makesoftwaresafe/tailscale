@@ -27,6 +27,7 @@ import (
 	"tailscale.com/types/tkatype"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/slicesx"
+	"tailscale.com/util/vizerror"
 )
 
 // CapabilityVersion represents the client's capability level. That
@@ -155,7 +156,8 @@ type CapabilityVersion int
 //   - 110: 2024-12-12: removed never-before-used Tailscale SSH public key support (#14373)
 //   - 111: 2025-01-14: Client supports a peer having Node.HomeDERP (issue #14636)
 //   - 112: 2025-01-14: Client interprets AllowedIPs of nil as meaning same as Addresses
-const CurrentCapabilityVersion CapabilityVersion = 112
+//   - 113: 2025-01-20: Client communicates to control whether funnel is enabled by sending Hostinfo.IngressEnabled (#14688)
+const CurrentCapabilityVersion CapabilityVersion = 113
 
 // ID is an integer ID for a user, node, or login allocated by the
 // control plane.
@@ -716,21 +718,6 @@ func CheckTag(tag string) error {
 	return nil
 }
 
-// CheckServiceName validates svc for use as a service name.
-// We only allow valid DNS labels, since the expectation is that these will be
-// used as parts of domain names.
-func CheckServiceName(svc string) error {
-	var ok bool
-	svc, ok = strings.CutPrefix(svc, "svc:")
-	if !ok {
-		return errors.New("services must start with 'svc:'")
-	}
-	if svc == "" {
-		return errors.New("service names must not be empty")
-	}
-	return dnsname.ValidLabel(svc)
-}
-
 // CheckRequestTags checks that all of h.RequestTags are valid.
 func (h *Hostinfo) CheckRequestTags() error {
 	if h == nil {
@@ -869,6 +856,7 @@ type Hostinfo struct {
 	ShareeNode      bool           `json:",omitempty"` // indicates this node exists in netmap because it's owned by a shared-to user
 	NoLogsNoSupport bool           `json:",omitempty"` // indicates that the user has opted out of sending logs and support
 	WireIngress     bool           `json:",omitempty"` // indicates that the node wants the option to receive ingress connections
+	IngressEnabled  bool           `json:",omitempty"` // if the node has any funnel endpoint enabled
 	AllowsUpdate    bool           `json:",omitempty"` // indicates that the node has opted-in to admin-console-drive remote updates
 	Machine         string         `json:",omitempty"` // the current host's machine type (uname -m)
 	GoArch          string         `json:",omitempty"` // GOARCH value (of the built binary)
@@ -895,16 +883,51 @@ type Hostinfo struct {
 	//       require changes to Hostinfo.Equal.
 }
 
+// ServiceName is the name of a service, of the form `svc:dns-label`. Services
+// represent some kind of application provided for users of the tailnet with a
+// MagicDNS name and possibly dedicated IP addresses. Currently (2024-01-21),
+// the only type of service is [VIPService].
+// This is not related to the older [Service] used in [Hostinfo.Services].
+type ServiceName string
+
+// Validate validates if the service name is formatted correctly.
+// We only allow valid DNS labels, since the expectation is that these will be
+// used as parts of domain names. All errors are [vizerror.Error].
+func (sn ServiceName) Validate() error {
+	bareName, ok := strings.CutPrefix(string(sn), "svc:")
+	if !ok {
+		return vizerror.Errorf("%q is not a valid service name: must start with 'svc:'", sn)
+	}
+	if bareName == "" {
+		return vizerror.Errorf("%q is not a valid service name: must not be empty after the 'svc:' prefix", sn)
+	}
+	return dnsname.ValidLabel(bareName)
+}
+
+// String implements [fmt.Stringer].
+func (sn ServiceName) String() string {
+	return string(sn)
+}
+
+// WithoutPrefix is the name of the service without the `svc:` prefix, used for
+// DNS names. If the name does not include the prefix (which means
+// [ServiceName.Validate] would return an error) then it returns "".
+func (sn ServiceName) WithoutPrefix() string {
+	bareName, ok := strings.CutPrefix(string(sn), "svc:")
+	if !ok {
+		return ""
+	}
+	return bareName
+}
+
 // VIPService represents a service created on a tailnet from the
 // perspective of a node providing that service. These services
 // have an virtual IP (VIP) address pair distinct from the node's IPs.
 type VIPService struct {
-	// Name is the name of the service, of the form `svc:dns-label`.
-	// See CheckServiceName for a validation func.
-	// Name uniquely identifies a service on a particular tailnet,
-	// and so also corresponds uniquely to the pair of IP addresses
-	// belonging to the VIP service.
-	Name string
+	// Name is the name of the service. The Name uniquely identifies a service
+	// on a particular tailnet, and so also corresponds uniquely to the pair of
+	// IP addresses belonging to the VIP service.
+	Name ServiceName
 
 	// Ports specify which ProtoPorts are made available by this node
 	// on the service's IPs.
@@ -924,14 +947,6 @@ func (hi *Hostinfo) TailscaleSSHEnabled() bool {
 }
 
 func (v HostinfoView) TailscaleSSHEnabled() bool { return v.ж.TailscaleSSHEnabled() }
-
-// TailscaleFunnelEnabled reports whether or not this node has explicitly
-// enabled Funnel.
-func (hi *Hostinfo) TailscaleFunnelEnabled() bool {
-	return hi != nil && hi.WireIngress
-}
-
-func (v HostinfoView) TailscaleFunnelEnabled() bool { return v.ж.TailscaleFunnelEnabled() }
 
 // NetInfo contains information about the host's network state.
 type NetInfo struct {
@@ -2455,6 +2470,11 @@ const (
 	// automatically when the network state changes.
 	NodeAttrDisableCaptivePortalDetection NodeCapability = "disable-captive-portal-detection"
 
+	// NodeAttrDisableSkipStatusQueue is set when the node should disable skipping
+	// of queued netmap.NetworkMap between the controlclient and LocalBackend.
+	// See tailscale/tailscale#14768.
+	NodeAttrDisableSkipStatusQueue NodeCapability = "disable-skip-status-queue"
+
 	// NodeAttrSSHEnvironmentVariables enables logic for handling environment variables sent
 	// via SendEnv in the SSH server and applying them to the SSH session.
 	NodeAttrSSHEnvironmentVariables NodeCapability = "ssh-env-vars"
@@ -2978,10 +2998,10 @@ type EarlyNoise struct {
 // vs NodeKey)
 const LBHeader = "Ts-Lb"
 
-// ServiceIPMappings maps service names (strings that conform to
-// [CheckServiceName]) to lists of IP addresses. This is used as the value of
-// the [NodeAttrServiceHost] capability, to inform service hosts what IP
-// addresses they need to listen on for each service that they are advertising.
+// ServiceIPMappings maps ServiceName to lists of IP addresses. This is used
+// as the value of the [NodeAttrServiceHost] capability, to inform service hosts
+// what IP addresses they need to listen on for each service that they are
+// advertising.
 //
 // This is of the form:
 //
@@ -2994,4 +3014,4 @@ const LBHeader = "Ts-Lb"
 // provided in AllowedIPs, but this lets the client know which services
 // correspond to those IPs. Any services that don't correspond to a service
 // this client is hosting can be ignored.
-type ServiceIPMappings map[string][]netip.Addr
+type ServiceIPMappings map[ServiceName][]netip.Addr
