@@ -30,7 +30,7 @@ import (
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/netipx"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/local"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/net/netmon"
@@ -431,6 +431,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 		t := time.NewTicker(time.Second / time.Duration(packetsPerSecond))
 		defer t.Stop()
 
+		toDERPPubKey := toc.SelfPublicKey()
 		seq := uint64(0)
 		for {
 			select {
@@ -446,7 +447,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 				txRecordsMu.Unlock()
 				binary.BigEndian.PutUint64(pkt, seq)
 				seq++
-				if err := fromc.Send(toc.SelfPublicKey(), pkt); err != nil {
+				if err := fromc.Send(toDERPPubKey, pkt); err != nil {
 					sendErrC <- fmt.Errorf("sending packet %w", err)
 					return
 				}
@@ -460,6 +461,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 	go func() {
 		defer wg.Done()
 		defer close(recvFinishedC) // to break out of 'select' below.
+		fromDERPPubKey := fromc.SelfPublicKey()
 		for {
 			m, err := toc.Recv()
 			if err != nil {
@@ -469,7 +471,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 			switch v := m.(type) {
 			case derp.ReceivedPacket:
 				now := time.Now()
-				if v.Source != fromc.SelfPublicKey() {
+				if v.Source != fromDERPPubKey {
 					recvFinishedC <- fmt.Errorf("got data packet from unexpected source, %v", v.Source)
 					return
 				}
@@ -532,7 +534,7 @@ func (d *derpProber) getNodePair(n1, n2 string) (ret1, ret2 *tailcfg.DERPNode, _
 	return ret1, ret2, nil
 }
 
-var tsLocalClient tailscale.LocalClient
+var tsLocalClient local.Client
 
 // updateMap refreshes the locally-cached DERP map.
 func (d *derpProber) updateMap(ctx context.Context) error {
@@ -767,9 +769,10 @@ func runDerpProbeNodePair(ctx context.Context, from, to *tailcfg.DERPNode, fromc
 	// Send the packets.
 	sendc := make(chan error, 1)
 	go func() {
+		toDERPPubKey := toc.SelfPublicKey()
 		for idx, pkt := range pkts {
 			inFlight.AcquireContext(ctx)
-			if err := fromc.Send(toc.SelfPublicKey(), pkt); err != nil {
+			if err := fromc.Send(toDERPPubKey, pkt); err != nil {
 				sendc <- fmt.Errorf("sending packet %d: %w", idx, err)
 				return
 			}
@@ -781,6 +784,7 @@ func runDerpProbeNodePair(ctx context.Context, from, to *tailcfg.DERPNode, fromc
 	go func() {
 		defer close(recvc) // to break out of 'select' below.
 		idx := 0
+		fromDERPPubKey := fromc.SelfPublicKey()
 		for {
 			m, err := toc.Recv()
 			if err != nil {
@@ -790,7 +794,7 @@ func runDerpProbeNodePair(ctx context.Context, from, to *tailcfg.DERPNode, fromc
 			switch v := m.(type) {
 			case derp.ReceivedPacket:
 				inFlight.Release()
-				if v.Source != fromc.SelfPublicKey() {
+				if v.Source != fromDERPPubKey {
 					recvc <- fmt.Errorf("got data packet %d from unexpected source, %v", idx, v.Source)
 					return
 				}
@@ -925,6 +929,7 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesT
 
 		destinationAddrBytes := destinationAddr.AsSlice()
 		scratch := make([]byte, 4)
+		toDERPPubKey := toc.SelfPublicKey()
 		for {
 			n, err := dev.Read(bufs, sizes, tunStartOffset)
 			if err != nil {
@@ -953,7 +958,7 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesT
 				copy(pkt[12:16], pkt[16:20])
 				copy(pkt[16:20], scratch)
 
-				if err := fromc.Send(toc.SelfPublicKey(), pkt); err != nil {
+				if err := fromc.Send(toDERPPubKey, pkt); err != nil {
 					tunReadErrC <- err
 					return
 				}
@@ -971,6 +976,7 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesT
 		buf := make([]byte, mtu+tunStartOffset)
 		bufs := make([][]byte, 1)
 
+		fromDERPPubKey := fromc.SelfPublicKey()
 		for {
 			m, err := toc.Recv()
 			if err != nil {
@@ -979,7 +985,7 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesT
 			}
 			switch v := m.(type) {
 			case derp.ReceivedPacket:
-				if v.Source != fromc.SelfPublicKey() {
+				if v.Source != fromDERPPubKey {
 					recvErrC <- fmt.Errorf("got data packet from unexpected source, %v", v.Source)
 					return
 				}
@@ -1042,6 +1048,7 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesT
 		readConn, err := l.Accept()
 		if err != nil {
 			readFinishedC <- err
+			return
 		}
 		defer readConn.Close()
 		deadline, ok := ctx.Deadline()
@@ -1049,6 +1056,7 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesT
 			// Don't try reading past our context's deadline.
 			if err := readConn.SetReadDeadline(deadline); err != nil {
 				readFinishedC <- fmt.Errorf("unable to set read deadline: %w", err)
+				return
 			}
 		}
 		n, err := io.CopyN(io.Discard, readConn, size)
